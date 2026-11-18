@@ -1,9 +1,20 @@
 
 from typing import Sized, overload
-from typing_extensions import Literal, Protocol
+from typing_extensions import Literal, Protocol, TypedDict
 
 class _Vector(Protocol, Sized):
     def __getitem__(self, __index: int) -> float: ...
+
+class _QueryStats(TypedDict):
+    queries_started: int
+    queries_completed: int
+    queries_rejected: int
+    active_queries: int
+    queued_queries: int
+    queued_events: int
+    total_wait_ms: float
+    max_wait_ms: float
+    max_concurrency: int
 
 class AnnoyIndex:
     f: int
@@ -41,5 +52,8 @@ class AnnoyIndex:
     def get_distance(self, __i: int, __j: int) -> float: ...
     def get_n_items(self) -> int: ...
     def get_n_trees(self) -> int: ...
+    def set_max_query_concurrency(self, limit: int) -> None: ...
+    def get_query_stats(self) -> _QueryStats: ...
+    def reset_query_stats(self) -> None: ...
     def verbose(self, __v: bool) -> Literal[True]: ...
     def set_seed(self, __s: int) -> None: ...

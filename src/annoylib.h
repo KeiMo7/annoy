@@ -66,6 +66,9 @@ typedef signed __int64    int64_t;
 #include <thread>
 #include <mutex>
 #include <shared_mutex>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #endif
 
 #ifdef _MSC_VER
@@ -901,6 +904,37 @@ struct Manhattan : Minkowski {
   }
 };
 
+enum AnnoyQueryStatus {
+  ANNOY_QUERY_OK = 0,
+  ANNOY_QUERY_NOT_READY = 1,
+  ANNOY_QUERY_ITEM_OUT_OF_RANGE = 2
+};
+
+inline const char* annoy_query_status_string(AnnoyQueryStatus status) {
+  switch (status) {
+    case ANNOY_QUERY_OK:
+      return "ok";
+    case ANNOY_QUERY_NOT_READY:
+      return "index is not built or has been unloaded";
+    case ANNOY_QUERY_ITEM_OUT_OF_RANGE:
+      return "item index is out of range";
+    default:
+      return "unknown query status";
+  }
+}
+
+struct AnnoyQueryStats {
+  uint64_t queries_started;
+  uint64_t queries_completed;
+  uint64_t queries_rejected;
+  uint64_t active_queries;
+  uint64_t queued_queries;
+  uint64_t queued_events;
+  uint64_t total_wait_ns;
+  uint64_t max_wait_ns;
+  uint64_t max_concurrency;
+};
+
 template<typename S, typename T, typename R = uint64_t>
 class AnnoyIndexInterface {
  public:
@@ -913,14 +947,284 @@ class AnnoyIndexInterface {
   virtual void unload() = 0;
   virtual bool load(const char* filename, bool prefault=false, char** error=NULL) = 0;
   virtual T get_distance(S i, S j) const = 0;
+  virtual AnnoyQueryStatus get_distance_with_status(S i, S j, T* distance) const = 0;
   virtual void get_nns_by_item(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
   virtual void get_nns_by_vector(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
+  virtual AnnoyQueryStatus get_nns_by_item_with_status(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
+  virtual AnnoyQueryStatus get_nns_by_vector_with_status(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
   virtual S get_n_items() const = 0;
   virtual S get_n_trees() const = 0;
   virtual void verbose(bool v) = 0;
   virtual void get_item(S item, T* v) const = 0;
+  virtual AnnoyQueryStatus get_item_with_status(S item, T* v) const = 0;
   virtual void set_seed(R q) = 0;
   virtual bool on_disk_build(const char* filename, char** error=NULL) = 0;
+  virtual void set_max_query_concurrency(size_t limit) = 0;
+  virtual size_t get_max_query_concurrency() const = 0;
+  virtual AnnoyQueryStats get_query_stats() const = 0;
+  virtual void reset_query_stats() = 0;
+};
+
+class QueryConcurrencyController {
+ public:
+#ifdef ANNOYLIB_MULTITHREADED_BUILD
+  class ReadGuard {
+   public:
+    explicit ReadGuard(const QueryConcurrencyController& parent)
+      : _parent(parent), _started(std::chrono::steady_clock::now()), _active(false) {
+      _parent.enter_read();
+      _parent._structure_mutex.lock_shared();
+      _parent.record_wait(_started);
+      _active = true;
+    }
+
+    ~ReadGuard() {
+      if (_active) {
+        _parent._structure_mutex.unlock_shared();
+        _parent.exit_read();
+      }
+    }
+
+   private:
+    ReadGuard(const ReadGuard&);
+    ReadGuard& operator=(const ReadGuard&);
+
+    const QueryConcurrencyController& _parent;
+    std::chrono::steady_clock::time_point _started;
+    bool _active;
+  };
+
+  class WriteGuard {
+   public:
+    explicit WriteGuard(const QueryConcurrencyController& parent)
+      : _parent(parent), _active(false) {
+      _parent.enter_write();
+      _parent._structure_mutex.lock();
+      _active = true;
+    }
+
+    ~WriteGuard() {
+      if (_active) {
+        _parent._structure_mutex.unlock();
+        _parent.exit_write();
+      }
+    }
+
+   private:
+    WriteGuard(const WriteGuard&);
+    WriteGuard& operator=(const WriteGuard&);
+
+    const QueryConcurrencyController& _parent;
+    bool _active;
+  };
+
+  QueryConcurrencyController()
+    : _queries_started(0),
+      _queries_completed(0),
+      _queries_rejected(0),
+      _queued_events(0),
+      _total_wait_ns(0),
+      _max_wait_ns(0),
+      _max_query_concurrency(0),
+      _active_queries(0),
+      _waiting_queries(0),
+      _waiting_writers(0),
+      _write_active(false) {}
+
+  void set_max_query_concurrency(size_t limit) {
+    std::lock_guard<std::mutex> lock(_gate_mutex);
+    _max_query_concurrency = limit;
+    _gate_cv.notify_all();
+  }
+
+  size_t get_max_query_concurrency() const {
+    std::lock_guard<std::mutex> lock(_gate_mutex);
+    return _max_query_concurrency;
+  }
+
+  AnnoyQueryStats get_stats() const {
+    AnnoyQueryStats stats;
+    stats.queries_started = _queries_started.load(std::memory_order_relaxed);
+    stats.queries_completed = _queries_completed.load(std::memory_order_relaxed);
+    stats.queries_rejected = _queries_rejected.load(std::memory_order_relaxed);
+    stats.queued_events = _queued_events.load(std::memory_order_relaxed);
+    stats.total_wait_ns = _total_wait_ns.load(std::memory_order_relaxed);
+    stats.max_wait_ns = _max_wait_ns.load(std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(_gate_mutex);
+      stats.active_queries = _active_queries;
+      stats.queued_queries = _waiting_queries;
+      stats.max_concurrency = _max_query_concurrency;
+    }
+    return stats;
+  }
+
+  void reset_stats() {
+    _queries_started.store(0, std::memory_order_relaxed);
+    _queries_completed.store(0, std::memory_order_relaxed);
+    _queries_rejected.store(0, std::memory_order_relaxed);
+    _queued_events.store(0, std::memory_order_relaxed);
+    _total_wait_ns.store(0, std::memory_order_relaxed);
+    _max_wait_ns.store(0, std::memory_order_relaxed);
+  }
+
+  void mark_rejected() const {
+    _queries_rejected.fetch_add(1, std::memory_order_relaxed);
+  }
+
+ private:
+  void enter_read() const {
+    _queries_started.fetch_add(1, std::memory_order_relaxed);
+
+    std::unique_lock<std::mutex> lock(_gate_mutex);
+    _waiting_queries++;
+    bool queued = false;
+    while (_write_active || _waiting_writers > 0 ||
+           (_max_query_concurrency > 0 && _active_queries >= _max_query_concurrency)) {
+      if (!queued) {
+        _queued_events.fetch_add(1, std::memory_order_relaxed);
+        queued = true;
+      }
+      _gate_cv.wait(lock);
+    }
+    _waiting_queries--;
+    _active_queries++;
+  }
+
+  void exit_read() const {
+    {
+      std::lock_guard<std::mutex> lock(_gate_mutex);
+      _active_queries--;
+    }
+    _queries_completed.fetch_add(1, std::memory_order_relaxed);
+    _gate_cv.notify_all();
+  }
+
+  void enter_write() const {
+    std::unique_lock<std::mutex> lock(_gate_mutex);
+    _waiting_writers++;
+    _gate_cv.notify_all();
+    while (_write_active || _active_queries > 0) {
+      _gate_cv.wait(lock);
+    }
+    _waiting_writers--;
+    _write_active = true;
+  }
+
+  void exit_write() const {
+    {
+      std::lock_guard<std::mutex> lock(_gate_mutex);
+      _write_active = false;
+    }
+    _gate_cv.notify_all();
+  }
+
+  void record_wait(const std::chrono::steady_clock::time_point& started) const {
+    const uint64_t wait_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - started).count();
+    _total_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    uint64_t observed = _max_wait_ns.load(std::memory_order_relaxed);
+    while (wait_ns > observed &&
+           !_max_wait_ns.compare_exchange_weak(observed, wait_ns,
+              std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+  }
+
+  mutable std::shared_timed_mutex _structure_mutex;
+  mutable std::mutex _gate_mutex;
+  mutable std::condition_variable _gate_cv;
+  mutable std::atomic<uint64_t> _queries_started;
+  mutable std::atomic<uint64_t> _queries_completed;
+  mutable std::atomic<uint64_t> _queries_rejected;
+  mutable std::atomic<uint64_t> _queued_events;
+  mutable std::atomic<uint64_t> _total_wait_ns;
+  mutable std::atomic<uint64_t> _max_wait_ns;
+  mutable size_t _max_query_concurrency;
+  mutable size_t _active_queries;
+  mutable size_t _waiting_queries;
+  mutable size_t _waiting_writers;
+  mutable bool _write_active;
+#else
+  class ReadGuard {
+   public:
+    explicit ReadGuard(const QueryConcurrencyController& parent)
+      : _parent(parent), _active(false) {
+      _parent._queries_started++;
+      _active = true;
+    }
+
+    ~ReadGuard() {
+      if (_active) {
+        _parent._queries_completed++;
+      }
+    }
+
+   private:
+    ReadGuard(const ReadGuard&);
+    ReadGuard& operator=(const ReadGuard&);
+
+    const QueryConcurrencyController& _parent;
+    bool _active;
+  };
+
+  class WriteGuard {
+   public:
+    explicit WriteGuard(const QueryConcurrencyController&) {}
+  };
+
+  QueryConcurrencyController()
+    : _queries_started(0),
+      _queries_completed(0),
+      _queries_rejected(0),
+      _queued_events(0),
+      _total_wait_ns(0),
+      _max_wait_ns(0),
+      _max_query_concurrency(0) {}
+
+  void set_max_query_concurrency(size_t limit) {
+    _max_query_concurrency = limit;
+  }
+
+  size_t get_max_query_concurrency() const {
+    return _max_query_concurrency;
+  }
+
+  AnnoyQueryStats get_stats() const {
+    AnnoyQueryStats stats;
+    stats.queries_started = _queries_started;
+    stats.queries_completed = _queries_completed;
+    stats.queries_rejected = _queries_rejected;
+    stats.active_queries = 0;
+    stats.queued_queries = 0;
+    stats.queued_events = _queued_events;
+    stats.total_wait_ns = _total_wait_ns;
+    stats.max_wait_ns = _max_wait_ns;
+    stats.max_concurrency = _max_query_concurrency;
+    return stats;
+  }
+
+  void reset_stats() {
+    _queries_started = 0;
+    _queries_completed = 0;
+    _queries_rejected = 0;
+    _queued_events = 0;
+    _total_wait_ns = 0;
+    _max_wait_ns = 0;
+  }
+
+  void mark_rejected() const {
+    _queries_rejected++;
+  }
+
+ private:
+  mutable uint64_t _queries_started;
+  mutable uint64_t _queries_completed;
+  mutable uint64_t _queries_rejected;
+  mutable uint64_t _queued_events;
+  mutable uint64_t _total_wait_ns;
+  mutable uint64_t _max_wait_ns;
+  size_t _max_query_concurrency;
+#endif
 };
 
 template<typename S, typename T, typename Distance, typename Random, class ThreadedBuildPolicy>
@@ -962,6 +1266,7 @@ protected:
   int _fd;
   bool _on_disk;
   bool _built;
+  mutable QueryConcurrencyController _concurrency;
 public:
 
    AnnoyIndex(int f) : _f(f), _seed(Random::default_seed) {
@@ -980,6 +1285,7 @@ public:
   }
 
   bool add_item(S item, const T* w, char** error=NULL) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
     return add_item_impl(item, w, error);
   }
 
@@ -1010,6 +1316,11 @@ public:
   }
     
   bool on_disk_build(const char* file, char** error=NULL) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
+    return on_disk_build_impl(file, error);
+  }
+
+  bool on_disk_build_impl(const char* file, char** error=NULL) {
     _on_disk = true;
 #ifndef _MSC_VER
     _fd = open(file, O_RDWR | O_CREAT | O_TRUNC, (int) 0600);
@@ -1035,6 +1346,11 @@ public:
   }
     
   bool build(int q, int n_threads=-1, char** error=NULL) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
+    return build_impl(q, n_threads, error);
+  }
+
+  bool build_impl(int q, int n_threads=-1, char** error=NULL) {
     if (_loaded) {
       set_error_from_string(error, "You can't build a loaded index");
       return false;
@@ -1078,6 +1394,11 @@ public:
   }
   
   bool unbuild(char** error=NULL) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
+    return unbuild_impl(error);
+  }
+
+  bool unbuild_impl(char** error=NULL) {
     if (_loaded) {
       set_error_from_string(error, "You can't unbuild a loaded index");
       return false;
@@ -1091,6 +1412,11 @@ public:
   }
 
   bool save(const char* filename, bool prefault=false, char** error=NULL) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
+    return save_impl(filename, prefault, error);
+  }
+
+  bool save_impl(const char* filename, bool prefault=false, char** error=NULL) {
     if (!_built) {
       set_error_from_string(error, "You can't save an index that hasn't been built");
       return false;
@@ -1121,8 +1447,8 @@ public:
         return false;
       }
 
-      unload();
-      return load(filename, prefault, error);
+      unload_impl();
+      return load_impl(filename, prefault, error);
     }
   }
 
@@ -1139,6 +1465,11 @@ public:
   }
 
   void unload() {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
+    unload_impl();
+  }
+
+  void unload_impl() {
     if (_on_disk && _fd) {
 #ifndef _MSC_VER
       close(_fd);
@@ -1165,6 +1496,11 @@ public:
   }
 
   bool load(const char* filename, bool prefault=false, char** error=NULL) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
+    return load_impl(filename, prefault, error);
+  }
+
+  bool load_impl(const char* filename, bool prefault=false, char** error=NULL) {
 #ifndef _MSC_VER
     _fd = open(filename, O_RDONLY, (int)0400);
 #else
@@ -1222,39 +1558,107 @@ public:
   }
 
   T get_distance(S i, S j) const {
-    return D::normalized_distance(D::distance(_get(i), _get(j), _f));
+    T distance = 0;
+    (void)get_distance_with_status(i, j, &distance);
+    return distance;
+  }
+
+  AnnoyQueryStatus get_distance_with_status(S i, S j, T* distance) const {
+    QueryConcurrencyController::ReadGuard lock(_concurrency);
+    if (!_nodes) {
+      return ANNOY_QUERY_NOT_READY;
+    }
+    if (i < 0 || j < 0 || (size_t)i >= (size_t)_n_items || (size_t)j >= (size_t)_n_items) {
+      return ANNOY_QUERY_ITEM_OUT_OF_RANGE;
+    }
+    *distance = D::normalized_distance(D::distance(_get(i), _get(j), _f));
+    return ANNOY_QUERY_OK;
   }
 
   void get_nns_by_item(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
-    // TODO: handle OOB
+    (void)get_nns_by_item_with_status(item, n, search_k, result, distances);
+  }
+
+  AnnoyQueryStatus get_nns_by_item_with_status(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
+    QueryConcurrencyController::ReadGuard lock(_concurrency);
+    if (!_built || !_nodes) {
+      _concurrency.mark_rejected();
+      return ANNOY_QUERY_NOT_READY;
+    }
+    if (item < 0 || (size_t)item >= (size_t)_n_items) {
+      _concurrency.mark_rejected();
+      return ANNOY_QUERY_ITEM_OUT_OF_RANGE;
+    }
     const Node* m = _get(item);
     _get_all_nns(m->v, n, search_k, result, distances);
+    return ANNOY_QUERY_OK;
   }
 
   void get_nns_by_vector(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
+    (void)get_nns_by_vector_with_status(w, n, search_k, result, distances);
+  }
+
+  AnnoyQueryStatus get_nns_by_vector_with_status(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
+    QueryConcurrencyController::ReadGuard lock(_concurrency);
+    if (!_built || !_nodes) {
+      _concurrency.mark_rejected();
+      return ANNOY_QUERY_NOT_READY;
+    }
     _get_all_nns(w, n, search_k, result, distances);
+    return ANNOY_QUERY_OK;
   }
 
   S get_n_items() const {
+    QueryConcurrencyController::ReadGuard lock(_concurrency);
     return _n_items;
   }
 
   S get_n_trees() const {
+    QueryConcurrencyController::ReadGuard lock(_concurrency);
     return (S)_roots.size();
   }
 
   void verbose(bool v) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
     _verbose = v;
   }
 
   void get_item(S item, T* v) const {
-    // TODO: handle OOB
+    (void)get_item_with_status(item, v);
+  }
+
+  AnnoyQueryStatus get_item_with_status(S item, T* v) const {
+    QueryConcurrencyController::ReadGuard lock(_concurrency);
+    if (!_nodes) {
+      return ANNOY_QUERY_NOT_READY;
+    }
+    if (item < 0 || (size_t)item >= (size_t)_n_items) {
+      return ANNOY_QUERY_ITEM_OUT_OF_RANGE;
+    }
     Node* m = _get(item);
     memcpy(v, m->v, (_f) * sizeof(T));
+    return ANNOY_QUERY_OK;
   }
 
   void set_seed(R seed) {
+    QueryConcurrencyController::WriteGuard lock(_concurrency);
     _seed = seed;
+  }
+
+  void set_max_query_concurrency(size_t limit) {
+    _concurrency.set_max_query_concurrency(limit);
+  }
+
+  size_t get_max_query_concurrency() const {
+    return _concurrency.get_max_query_concurrency();
+  }
+
+  AnnoyQueryStats get_query_stats() const {
+    return _concurrency.get_stats();
+  }
+
+  void reset_query_stats() {
+    _concurrency.reset_stats();
   }
 
   void thread_build(int q, int thread_idx, ThreadedBuildPolicy& threaded_build_policy) {

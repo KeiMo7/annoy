@@ -97,36 +97,62 @@ public:
   void unload() { _index.unload(); };
   bool load(const char* filename, bool prefault, char** error) { return _index.load(filename, prefault, error); };
   float get_distance(int32_t i, int32_t j) const { return _index.get_distance(i, j); };
+  AnnoyQueryStatus get_distance_with_status(int32_t i, int32_t j, float* distance) const {
+    uint64_t distance_internal = 0;
+    AnnoyQueryStatus status = _index.get_distance_with_status(i, j, &distance_internal);
+    if (status == ANNOY_QUERY_OK) {
+      *distance = (float)distance_internal;
+    }
+    return status;
+  };
   void get_nns_by_item(int32_t item, size_t n, int search_k, vector<int32_t>* result, vector<float>* distances) const {
+    (void)get_nns_by_item_with_status(item, n, search_k, result, distances);
+  };
+  AnnoyQueryStatus get_nns_by_item_with_status(int32_t item, size_t n, int search_k, vector<int32_t>* result, vector<float>* distances) const {
     if (distances) {
       vector<uint64_t> distances_internal;
-      _index.get_nns_by_item(item, n, search_k, result, &distances_internal);
+      AnnoyQueryStatus status = _index.get_nns_by_item_with_status(item, n, search_k, result, &distances_internal);
       distances->insert(distances->begin(), distances_internal.begin(), distances_internal.end());
+      return status;
     } else {
-      _index.get_nns_by_item(item, n, search_k, result, NULL);
+      return _index.get_nns_by_item_with_status(item, n, search_k, result, NULL);
     }
   };
   void get_nns_by_vector(const float* w, size_t n, int search_k, vector<int32_t>* result, vector<float>* distances) const {
+    (void)get_nns_by_vector_with_status(w, n, search_k, result, distances);
+  };
+  AnnoyQueryStatus get_nns_by_vector_with_status(const float* w, size_t n, int search_k, vector<int32_t>* result, vector<float>* distances) const {
     vector<uint64_t> w_internal(_f_internal, 0);
     _pack(w, &w_internal[0]);
     if (distances) {
       vector<uint64_t> distances_internal;
-      _index.get_nns_by_vector(&w_internal[0], n, search_k, result, &distances_internal);
+      AnnoyQueryStatus status = _index.get_nns_by_vector_with_status(&w_internal[0], n, search_k, result, &distances_internal);
       distances->insert(distances->begin(), distances_internal.begin(), distances_internal.end());
+      return status;
     } else {
-      _index.get_nns_by_vector(&w_internal[0], n, search_k, result, NULL);
+      return _index.get_nns_by_vector_with_status(&w_internal[0], n, search_k, result, NULL);
     }
   };
   int32_t get_n_items() const { return _index.get_n_items(); };
   int32_t get_n_trees() const { return _index.get_n_trees(); };
   void verbose(bool v) { _index.verbose(v); };
   void get_item(int32_t item, float* v) const {
+    (void)get_item_with_status(item, v);
+  };
+  AnnoyQueryStatus get_item_with_status(int32_t item, float* v) const {
     vector<uint64_t> v_internal(_f_internal, 0);
-    _index.get_item(item, &v_internal[0]);
-    _unpack(&v_internal[0], v);
+    AnnoyQueryStatus status = _index.get_item_with_status(item, &v_internal[0]);
+    if (status == ANNOY_QUERY_OK) {
+      _unpack(&v_internal[0], v);
+    }
+    return status;
   };
   void set_seed(uint64_t q) { _index.set_seed(q); };
   bool on_disk_build(const char* filename, char** error) { return _index.on_disk_build(filename, error); };
+  void set_max_query_concurrency(size_t limit) { _index.set_max_query_concurrency(limit); };
+  size_t get_max_query_concurrency() const { return _index.get_max_query_concurrency(); };
+  AnnoyQueryStats get_query_stats() const { return _index.get_query_stats(); };
+  void reset_query_stats() { _index.reset_query_stats(); };
 };
 
 // annoy python object
@@ -295,6 +321,18 @@ bool check_constraints(py_annoy *self, int32_t item, bool building) {
   }
 }
 
+bool set_query_status_error(AnnoyQueryStatus status) {
+  if (status == ANNOY_QUERY_OK) {
+    return true;
+  }
+  if (status == ANNOY_QUERY_ITEM_OUT_OF_RANGE) {
+    PyErr_SetString(PyExc_IndexError, annoy_query_status_string(status));
+  } else {
+    PyErr_SetString(PyExc_RuntimeError, annoy_query_status_string(status));
+  }
+  return false;
+}
+
 static PyObject* 
 py_an_get_nns_by_item(py_annoy *self, PyObject *args, PyObject *kwargs) {
   int32_t item, n, search_k=-1, include_distances=0;
@@ -305,17 +343,17 @@ py_an_get_nns_by_item(py_annoy *self, PyObject *args, PyObject *kwargs) {
   if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ii|ii", (char**)kwlist, &item, &n, &search_k, &include_distances))
     return NULL;
 
-  if (!check_constraints(self, item, false)) {
-    return NULL;
-  }
-
   vector<int32_t> result;
   vector<float> distances;
+  AnnoyQueryStatus status;
 
   Py_BEGIN_ALLOW_THREADS;
-  self->ptr->get_nns_by_item(item, n, search_k, &result, include_distances ? &distances : NULL);
+  status = self->ptr->get_nns_by_item_with_status(item, n, search_k, &result, include_distances ? &distances : NULL);
   Py_END_ALLOW_THREADS;
 
+  if (!set_query_status_error(status)) {
+    return NULL;
+  }
   return get_nns_to_python(result, distances, include_distances);
 }
 
@@ -369,11 +407,15 @@ py_an_get_nns_by_vector(py_annoy *self, PyObject *args, PyObject *kwargs) {
 
   vector<int32_t> result;
   vector<float> distances;
+  AnnoyQueryStatus status;
 
   Py_BEGIN_ALLOW_THREADS;
-  self->ptr->get_nns_by_vector(&w[0], n, search_k, &result, include_distances ? &distances : NULL);
+  status = self->ptr->get_nns_by_vector_with_status(&w[0], n, search_k, &result, include_distances ? &distances : NULL);
   Py_END_ALLOW_THREADS;
 
+  if (!set_query_status_error(status)) {
+    return NULL;
+  }
   return get_nns_to_python(result, distances, include_distances);
 }
 
@@ -386,12 +428,14 @@ py_an_get_item_vector(py_annoy *self, PyObject *args) {
   if (!PyArg_ParseTuple(args, "i", &item))
     return NULL;
 
-  if (!check_constraints(self, item, false)) {
+  vector<float> v(self->f);
+  AnnoyQueryStatus status;
+  Py_BEGIN_ALLOW_THREADS;
+  status = self->ptr->get_item_with_status(item, &v[0]);
+  Py_END_ALLOW_THREADS;
+  if (!set_query_status_error(status)) {
     return NULL;
   }
-
-  vector<float> v(self->f);
-  self->ptr->get_item(item, &v[0]);
   PyObject* l = PyList_New(self->f);
   if (l == NULL) {
     return NULL;
@@ -517,11 +561,16 @@ py_an_get_distance(py_annoy *self, PyObject *args) {
   if (!PyArg_ParseTuple(args, "ii", &i, &j))
     return NULL;
 
-  if (!check_constraints(self, i, false) || !check_constraints(self, j, false)) {
+  float distance;
+  AnnoyQueryStatus status;
+  Py_BEGIN_ALLOW_THREADS;
+  status = self->ptr->get_distance_with_status(i, j, &distance);
+  Py_END_ALLOW_THREADS;
+  if (!set_query_status_error(status)) {
     return NULL;
   }
 
-  double d = self->ptr->get_distance(i,j);
+  double d = distance;
   return PyFloat_FromDouble(d);
 }
 
@@ -542,6 +591,72 @@ py_an_get_n_trees(py_annoy *self) {
 
   int32_t n = self->ptr->get_n_trees();
   return PyInt_FromLong(n);
+}
+
+static bool set_stat_uint(PyObject* dict, const char* name, uint64_t value) {
+  PyObject* item = PyLong_FromUnsignedLongLong(value);
+  if (item == NULL) {
+    return false;
+  }
+  int result = PyDict_SetItemString(dict, name, item);
+  Py_DECREF(item);
+  return result == 0;
+}
+
+static bool set_stat_double(PyObject* dict, const char* name, double value) {
+  PyObject* item = PyFloat_FromDouble(value);
+  if (item == NULL) {
+    return false;
+  }
+  int result = PyDict_SetItemString(dict, name, item);
+  Py_DECREF(item);
+  return result == 0;
+}
+
+static PyObject *
+py_an_set_max_query_concurrency(py_annoy *self, PyObject *args) {
+  unsigned long long limit;
+  if (!self->ptr)
+    return NULL;
+  if (!PyArg_ParseTuple(args, "K", &limit))
+    return NULL;
+
+  self->ptr->set_max_query_concurrency((size_t)limit);
+  Py_RETURN_NONE;
+}
+
+static PyObject *
+py_an_get_query_stats(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+
+  AnnoyQueryStats stats = self->ptr->get_query_stats();
+  PyObject* dict = PyDict_New();
+  if (dict == NULL) {
+    return NULL;
+  }
+  if (!set_stat_uint(dict, "queries_started", stats.queries_started) ||
+      !set_stat_uint(dict, "queries_completed", stats.queries_completed) ||
+      !set_stat_uint(dict, "queries_rejected", stats.queries_rejected) ||
+      !set_stat_uint(dict, "active_queries", stats.active_queries) ||
+      !set_stat_uint(dict, "queued_queries", stats.queued_queries) ||
+      !set_stat_uint(dict, "queued_events", stats.queued_events) ||
+      !set_stat_double(dict, "total_wait_ms", (double)stats.total_wait_ns / 1000000.0) ||
+      !set_stat_double(dict, "max_wait_ms", (double)stats.max_wait_ns / 1000000.0) ||
+      !set_stat_uint(dict, "max_concurrency", stats.max_concurrency)) {
+    Py_DECREF(dict);
+    return NULL;
+  }
+  return dict;
+}
+
+static PyObject *
+py_an_reset_query_stats(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+
+  self->ptr->reset_query_stats();
+  Py_RETURN_NONE;
 }
 
 static PyObject *
@@ -586,6 +701,9 @@ static PyMethodDef AnnoyMethods[] = {
   {"get_distance",(PyCFunction)py_an_get_distance, METH_VARARGS, "Returns the distance between items `i` and `j`."},
   {"get_n_items",(PyCFunction)py_an_get_n_items, METH_NOARGS, "Returns the number of items in the index."},
   {"get_n_trees",(PyCFunction)py_an_get_n_trees, METH_NOARGS, "Returns the number of trees in the index."},
+  {"set_max_query_concurrency",(PyCFunction)py_an_set_max_query_concurrency, METH_VARARGS, "Sets the maximum number of in-flight queries. 0 means unlimited. Queries above the limit wait in FIFO-ish queues rather than fail."},
+  {"get_query_stats",(PyCFunction)py_an_get_query_stats, METH_NOARGS, "Returns query concurrency counters, including active/queued queries and wait times."},
+  {"reset_query_stats",(PyCFunction)py_an_reset_query_stats, METH_NOARGS, "Resets accumulated query counters and wait times."},
   {"verbose",(PyCFunction)py_an_verbose, METH_VARARGS, ""},
   {"set_seed",(PyCFunction)py_an_set_seed, METH_VARARGS, "Sets the seed of Annoy's random number generator."},
   {NULL, NULL, 0, NULL}		 /* Sentinel */

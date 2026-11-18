@@ -91,6 +91,70 @@ Notes:
 * There's no bounds checking performed on the values so be careful.
 * Annoy uses Euclidean distance of normalized vectors for its angular distance, which for two vectors u,v is equal to ``sqrt(2(1-cos(u,v)))``
 
+Concurrency
+-----------
+
+Annoy supports concurrent reads on one index. The implementation keeps the
+existing search routine unchanged and puts a per-index query gate around the
+public entry points:
+
+* Queries acquire a shared guard. Any number of concurrent queries can run as
+  long as the configured concurrency limit is not exceeded.
+* ``add_item``, ``build``, ``unbuild``, ``load``, ``unload``, ``save``,
+  ``set_seed``, and ``verbose`` acquire an exclusive writer guard. Readers
+  never observe a partially updated tree.
+* Writers are write-preferring. Once a writer is waiting, new readers queue
+  behind it, so a steady read stream cannot starve writes.
+* The isolation policy is blocking, not snapshot isolation. A query that
+  arrives during a write waits for the write to finish and then reads the new
+  complete state. If the index is unbuilt or has been unloaded when the query
+  gets the guard, ``get_nns_by_item`` / ``get_nns_by_vector`` raise
+  ``RuntimeError`` instead of dereferencing freed storage.
+* Every index has its own gate and its own counters. There is no process-wide
+  query lock, so writes to one index do not block reads from another index.
+
+Use ``set_max_query_concurrency(limit)`` to bound in-flight queries. ``0`` means
+unlimited. Queries above the limit wait in the gate queue; they are not
+rejected. ``get_query_stats()`` returns:
+
+* ``queries_started``, ``queries_completed``, and ``queries_rejected``
+* ``active_queries`` and ``queued_queries`` (instantaneous values)
+* ``queued_events`` (number of queries that had to wait at least once)
+* ``total_wait_ms`` and ``max_wait_ms``
+* ``max_concurrency`` (``0`` means unlimited)
+
+``queries_rejected`` counts explicit failures such as an unbuilt/unloaded
+index or an out-of-range item; exceeding the concurrency limit is a wait, not
+a rejection. ``reset_query_stats()`` resets accumulated counters without
+changing the in-flight query count or the configured limit.
+
+Concurrency semantics
+~~~~~~~~~~~~~~~~~~~~~
+
+The node array and persistence format are unchanged. ``_structure_mutex``
+protects the node array, root list, item count, and index lifecycle. A writer
+holds it exclusively; a reader holds it shared for the entire search. The
+``_gate_mutex`` only protects the admission state (active readers, waiting
+readers/writers, and the concurrency limit), so it is held briefly and does not
+serialize the search itself. The admission condition has the invariant
+``writer_active || waiting_writers > 0 || active_queries == limit => wait``.
+
+The reader/writer hand-off is synchronized by ``_structure_mutex``. Counters
+used only for observability are ``std::atomic<uint64_t>`` with relaxed ordering;
+admission state is protected by ``_gate_mutex``. The atomics are not used to
+protect index storage. A query may safely call the read-only inspection methods
+(nearest-neighbor search, ``get_item_vector``, ``get_distance``,
+``get_n_items`` and ``get_n_trees``) concurrently. Mutating methods are safe to
+call from different threads because they acquire the writer guard internally;
+callers must not retain pointers into an index while it is being unloaded.
+
+On a multi-core machine, shared guards allow real parallel searches. On a
+single-core machine the same code remains correct, but the scheduler can only
+run one search at a time; concurrency must not be expected to increase
+throughput there. The bounded gate still provides fairness and observability,
+but users should compare QPS on the target core count rather than assuming
+scaling.
+
 
 The C++ API is very similar: just ``#include "annoylib.h"`` to get access to it.
 
