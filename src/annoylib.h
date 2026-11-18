@@ -416,6 +416,12 @@ struct Base {
     // on the entire set of nodes passed into this index.
   }
 
+  template<typename T, typename Node>
+  static inline void postprocess_node(Node* node, const int f) {
+    // Override this in specific metric structs below if a single node needs
+    // post-processing right after it has been added to a built index.
+  }
+
   template<typename Node>
   static inline void zero_value(Node* dest) {
     // Initialize any fields that require sane defaults within this node.
@@ -701,6 +707,13 @@ struct DotProduct : Angular {
       node->built = true;
     }
   }
+
+  template<typename T, typename Node>
+  static inline void postprocess_node(Node* node, const int f) {
+    // Keep incrementally added items consistent with the ones that went
+    // through postprocess() at build time.
+    node->built = true;
+  }
 };
 
 struct Hamming : Base {
@@ -921,6 +934,9 @@ class AnnoyIndexInterface {
   virtual void get_item(S item, T* v) const = 0;
   virtual void set_seed(R q) = 0;
   virtual bool on_disk_build(const char* filename, char** error=NULL) = 0;
+  virtual bool thaw(char** error=NULL) = 0;
+  virtual S get_n_nodes() const = 0;
+  virtual bool has_item(S item) const = 0;
 };
 
 template<typename S, typename T, typename Distance, typename Random, class ThreadedBuildPolicy>
@@ -962,6 +978,8 @@ protected:
   int _fd;
   bool _on_disk;
   bool _built;
+  bool _roots_copied;
+  bool _incremental;
 public:
 
    AnnoyIndex(int f) : _f(f), _seed(Random::default_seed) {
@@ -986,9 +1004,19 @@ public:
   template<typename W>
   bool add_item_impl(S item, const W& w, char** error=NULL) {
     if (_loaded) {
-      set_error_from_string(error, "You can't add an item to a loaded index");
+      set_error_from_string(error, "You can't add an item to a loaded index. Call thaw() first to make it mutable");
       return false;
     }
+    if (_built && _on_disk) {
+      set_error_from_string(error, "You can't add items incrementally to an on-disk index");
+      return false;
+    }
+    // An item that already exists in a built index is updated in place:
+    // the trees reference items by id, so overwriting the vector is enough
+    // and the last write wins.
+    bool exists = _built && item < _n_items && _get(item)->n_descendants >= 1;
+    if (_built && !exists)
+      _strip_root_copies();
     _allocate_size(item + 1);
     Node* n = _get(item);
 
@@ -1005,6 +1033,19 @@ public:
 
     if (item >= _n_items)
       _n_items = item + 1;
+
+    if (_built) {
+      D::template postprocess_node<T, Node>(n, _f);
+      if (!exists) {
+        // Incremental insert into an already built index. Keep tree nodes
+        // above the item id space so the two never collide, then insert
+        // the item locally into every tree.
+        if (_n_nodes < _n_items)
+          _n_nodes = _n_items;
+        _insert_item_into_trees(item);
+        _incremental = true;
+      }
+    }
 
     return true;
   }
@@ -1053,10 +1094,7 @@ public:
 
     // Also, copy the roots into the last segment of the array
     // This way we can load them faster without reading the whole file
-    _allocate_size(_n_nodes + (S)_roots.size());
-    for (size_t i = 0; i < _roots.size(); i++)
-      memcpy(_get(_n_nodes + (S)i), _get(_roots[i]), _s);
-    _n_nodes += _roots.size();
+    _append_root_copies();
 
     if (_verbose) annoylib_showUpdate("has %d nodes\n", _n_nodes);
     
@@ -1083,18 +1121,29 @@ public:
       return false;
     }
 
+    if (_incremental) {
+      set_error_from_string(error, "You can't unbuild an incrementally updated index. Rebuild the items into a fresh index instead");
+      return false;
+    }
+
     _roots.clear();
     _n_nodes = _n_items;
     _built = false;
+    _roots_copied = false;
 
     return true;
   }
-
+  
   bool save(const char* filename, bool prefault=false, char** error=NULL) {
     if (!_built) {
       set_error_from_string(error, "You can't save an index that hasn't been built");
       return false;
     }
+    // Make sure the root copies at the end of the node array are up to
+    // date so that the saved file can be loaded like any other index.
+    // A loaded index already has the copies from its file on disk.
+    if (!_loaded)
+      _append_root_copies();
     if (_on_disk) {
       return true;
     } else {
@@ -1136,6 +1185,8 @@ public:
     _on_disk = false;
     _seed = Random::default_seed;
     _roots.clear();
+    _roots_copied = false;
+    _incremental = false;
   }
 
   void unload() {
@@ -1219,6 +1270,45 @@ public:
     _n_items = m;
     if (_verbose) annoylib_showUpdate("found %zu roots with degree %d\n", _roots.size(), m);
     return true;
+  }
+
+  bool thaw(char** error=NULL) {
+    // Turn a loaded (read-only, mmapped) index into a mutable in-memory
+    // one so that items can be added incrementally after the build.
+    if (!_loaded) {
+      set_error_from_string(error, "Only a loaded index can be thawed");
+      return false;
+    }
+    void* nodes = malloc(_s * (size_t)_n_nodes);
+    if (nodes == NULL) {
+      set_error_from_string(error, "Unable to allocate memory for thawed index");
+      return false;
+    }
+    memcpy(nodes, _nodes, _s * (size_t)_n_nodes);
+    munmap(_nodes, _n_nodes * _s);
+    if (_fd) {
+#ifndef _MSC_VER
+      close(_fd);
+#else
+      _close(_fd);
+#endif
+    }
+    _nodes = nodes;
+    _fd = 0;
+    _nodes_size = _n_nodes;
+    _loaded = false;
+    _on_disk = false;
+    _strip_root_copies();
+    if (_verbose) annoylib_showUpdate("thawed index into mutable memory\n");
+    return true;
+  }
+
+  S get_n_nodes() const {
+    return _n_nodes;
+  }
+
+  bool has_item(S item) const {
+    return item >= 0 && item < _n_items && _get(item)->n_descendants >= 1;
   }
 
   T get_distance(S i, S j) const {
@@ -1339,6 +1429,83 @@ protected:
     double rs = (float)right_indices.size();
     float f = ls / (ls + rs + 1e-9);  // Avoid 0/0
     return std::max(f, 1-f);
+  }
+
+  void _strip_root_copies() {
+    // build() and save() append a copy of every root at the very end of the
+    // node array so that load() can find the roots quickly. New tree nodes
+    // must be appended after the *real* nodes, so drop the stale copies
+    // before any incremental insert. save() re-appends fresh copies.
+    if (_roots_copied) {
+      _n_nodes -= (S)_roots.size();
+      _roots_copied = false;
+    }
+  }
+
+  void _append_root_copies() {
+    if (_roots_copied || _roots.empty())
+      return;
+    _allocate_size(_n_nodes + (S)_roots.size());
+    for (size_t i = 0; i < _roots.size(); i++)
+      memcpy(_get(_n_nodes + (S)i), _get(_roots[i]), _s);
+    _n_nodes += (S)_roots.size();
+    _roots_copied = true;
+  }
+
+  void _insert_item_into_trees(S item) {
+    // Incremental, local tree update: for every tree, descend from the root
+    // along the existing split planes to the leaf where the new item
+    // belongs and insert it there. Full leaves are re-split in place with
+    // the regular _make_tree machinery, so new items are spread over all
+    // existing trees instead of piling up in a single new tree.
+    ThreadedBuildPolicy threaded_build_policy;
+    Random random(_seed);
+    for (size_t t = 0; t < _roots.size(); t++) {
+      S node = _roots[t];
+      S parent = (S)-1;
+      int parent_side = 0;
+      while (true) {
+        // _nodes may be reallocated by _make_tree, so never keep node
+        // pointers across iterations.
+        const Node* item_node = _get(item);
+        Node* n = _get(node);
+        bool at_root = (parent == (S)-1);
+        if (n->n_descendants > _K) {
+          // Split node: keep the descendant count up to date and follow
+          // the split plane towards the matching subtree.
+          n->n_descendants = at_root ? _n_items : n->n_descendants + 1;
+          bool side = D::side(n, item_node, _f, random);
+          parent = node;
+          parent_side = (int)side;
+          node = n->children[side];
+        } else if (n->n_descendants == 1 && !at_root) {
+          // A leaf that is an item node: replace it with a small subtree
+          // holding both the old and the new item.
+          vector<S> indices;
+          indices.push_back(node);
+          indices.push_back(item);
+          S sub = _make_tree(indices, false, random, threaded_build_policy);
+          _get(parent)->children[parent_side] = sub;
+          break;
+        } else if (n->n_descendants < _K) {
+          // Leaf with spare capacity: append the new item to it.
+          n->children[n->n_descendants] = item;
+          n->n_descendants = at_root ? _n_items : n->n_descendants + 1;
+          break;
+        } else {
+          // Full leaf: re-split its items together with the new one using
+          // the regular tree building code and put the new subtree root
+          // where the leaf used to be, so parents stay valid.
+          vector<S> indices(n->children, n->children + n->n_descendants);
+          indices.push_back(item);
+          S sub = _make_tree(indices, false, random, threaded_build_policy);
+          memcpy(_get(node), _get(sub), _s);
+          if (at_root)
+            _get(node)->n_descendants = _n_items;
+          break;
+        }
+      }
+    }
   }
 
   S _make_tree(const vector<S>& indices, bool is_root, Random& _random, ThreadedBuildPolicy& threaded_build_policy) {

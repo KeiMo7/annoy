@@ -127,6 +127,9 @@ public:
   };
   void set_seed(uint64_t q) { _index.set_seed(q); };
   bool on_disk_build(const char* filename, char** error) { return _index.on_disk_build(filename, error); };
+  bool thaw(char** error) { return _index.thaw(error); };
+  int32_t get_n_nodes() const { return _index.get_n_nodes(); };
+  bool has_item(int32_t item) const { return _index.has_item(item); };
 };
 
 // annoy python object
@@ -440,6 +443,167 @@ py_an_add_item(py_annoy *self, PyObject *args, PyObject* kwargs) {
   Py_RETURN_NONE;
 }
 
+static PyObject*
+py_an_add_items(py_annoy *self, PyObject *args, PyObject* kwargs) {
+  // Adds a batch of (i, vector) pairs atomically: the whole batch is
+  // validated before anything is inserted, and the insertion loop runs
+  // while holding the GIL, so concurrent readers either see all of the
+  // batch or none of it.
+  PyObject* items;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"items", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", (char**)kwlist, &items))
+    return NULL;
+
+  PyObject* seq = PySequence_Fast(items, "items must be a sequence of (i, vector) pairs");
+  if (!seq)
+    return NULL;
+
+  Py_ssize_t count = PySequence_Fast_GET_SIZE(seq);
+  vector<int32_t> ids(count);
+  vector<vector<float> > ws(count);
+  bool duplicate = false;
+
+  // First pass: validate and convert everything so that a bad batch is
+  // rejected before anything is inserted.
+  for (Py_ssize_t k = 0; k < count; k++) {
+    PyObject* pair = PySequence_Fast_GET_ITEM(seq, k);
+    int32_t item;
+    PyObject* v;
+    if (!PyArg_ParseTuple(pair, "iO", &item, &v)) {
+      Py_DECREF(seq);
+      return NULL;
+    }
+    if (!check_constraints(self, item, true)) {
+      Py_DECREF(seq);
+      return NULL;
+    }
+    for (Py_ssize_t j = 0; j < k; j++)
+      if (ids[j] == item)
+        duplicate = true;
+    if (self->ptr->has_item(item))
+      duplicate = true;
+    ids[k] = item;
+    ws[k].resize(self->f);
+    if (!convert_list_to_vector(v, self->f, &ws[k])) {
+      Py_DECREF(seq);
+      return NULL;
+    }
+  }
+
+  if (duplicate &&
+      PyErr_WarnEx(PyExc_UserWarning,
+                   "duplicate item id in batch or index; the last write wins", 1) < 0) {
+    Py_DECREF(seq);
+    return NULL;
+  }
+
+  // Second pass: insert the whole batch.
+  for (Py_ssize_t k = 0; k < count; k++) {
+    char* error;
+    if (!self->ptr->add_item(ids[k], &ws[k][0], &error)) {
+      PyErr_SetString(PyExc_Exception, error);
+      free(error);
+      Py_DECREF(seq);
+      return NULL;
+    }
+  }
+
+  Py_DECREF(seq);
+  Py_RETURN_NONE;
+}
+
+static PyObject*
+py_an_append_items(py_annoy *self, PyObject *args, PyObject* kwargs) {
+  // Appends a batch of vectors, allocating a fresh item id for each one,
+  // and returns the allocated ids. Atomic like py_an_add_items.
+  PyObject* vectors;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"vectors", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", (char**)kwlist, &vectors))
+    return NULL;
+
+  PyObject* seq = PySequence_Fast(vectors, "vectors must be a sequence of vectors");
+  if (!seq)
+    return NULL;
+
+  Py_ssize_t count = PySequence_Fast_GET_SIZE(seq);
+  vector<vector<float> > ws(count);
+
+  for (Py_ssize_t k = 0; k < count; k++) {
+    ws[k].resize(self->f);
+    if (!convert_list_to_vector(PySequence_Fast_GET_ITEM(seq, k), self->f, &ws[k])) {
+      Py_DECREF(seq);
+      return NULL;
+    }
+  }
+
+  PyObject* result = PyList_New(count);
+  if (!result) {
+    Py_DECREF(seq);
+    return NULL;
+  }
+
+  for (Py_ssize_t k = 0; k < count; k++) {
+    // Item ids and tree nodes share the same id space; always allocate
+    // above both so a new item can never clobber a tree node.
+    int32_t item = self->ptr->get_n_items();
+    if (self->ptr->get_n_nodes() > item)
+      item = self->ptr->get_n_nodes();
+    char* error;
+    if (!self->ptr->add_item(item, &ws[k][0], &error)) {
+      PyErr_SetString(PyExc_Exception, error);
+      free(error);
+      Py_DECREF(seq);
+      Py_DECREF(result);
+      return NULL;
+    }
+    PyList_SET_ITEM(result, k, PyInt_FromLong(item));
+  }
+
+  Py_DECREF(seq);
+  return result;
+}
+
+static PyObject *
+py_an_thaw(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+
+  char* error;
+  if (!self->ptr->thaw(&error)) {
+    PyErr_SetString(PyExc_Exception, error);
+    free(error);
+    return NULL;
+  }
+
+  Py_RETURN_TRUE;
+}
+
+static PyObject *
+py_an_get_n_nodes(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+
+  int32_t n = self->ptr->get_n_nodes();
+  return PyInt_FromLong(n);
+}
+
+static PyObject *
+py_an_has_item(py_annoy *self, PyObject *args) {
+  int32_t item;
+  if (!self->ptr)
+    return NULL;
+  if (!PyArg_ParseTuple(args, "i", &item))
+    return NULL;
+
+  if (self->ptr->has_item(item))
+    Py_RETURN_TRUE;
+  Py_RETURN_FALSE;
+}
+
 static PyObject *
 py_an_on_disk_build(py_annoy *self, PyObject *args, PyObject *kwargs) {
   char *filename, *error;
@@ -579,8 +743,13 @@ static PyMethodDef AnnoyMethods[] = {
   {"get_nns_by_vector",(PyCFunction)py_an_get_nns_by_vector, METH_VARARGS | METH_KEYWORDS, "Returns the `n` closest items to vector `vector`.\n\n:param search_k: the query will inspect up to `search_k` nodes.\n`search_k` gives you a run-time tradeoff between better accuracy and speed.\n`search_k` defaults to `n_trees * n` if not provided.\n\n:param include_distances: If `True`, this function will return a\n2 element tuple of lists. The first list contains the `n` closest items.\nThe second list contains the corresponding distances."},
   {"get_item_vector",(PyCFunction)py_an_get_item_vector, METH_VARARGS, "Returns the vector for item `i` that was previously added."},
   {"add_item",(PyCFunction)py_an_add_item, METH_VARARGS | METH_KEYWORDS, "Adds item `i` (any nonnegative integer) with vector `v`.\n\nNote that it will allocate memory for `max(i)+1` items."},
+  {"add_items",(PyCFunction)py_an_add_items, METH_VARARGS | METH_KEYWORDS, "Adds a batch of `(i, vector)` pairs atomically.\n\nThe whole batch is validated before anything is inserted and the\ninsertion is atomic with respect to concurrent queries."},
+  {"append_items",(PyCFunction)py_an_append_items, METH_VARARGS | METH_KEYWORDS, "Appends a batch of vectors and returns the allocated item ids.\n\nNew ids are allocated above the current item and node id space, so\nincrementally added items live in an id range separate from the\noriginal items. The batch is applied atomically."},
+  {"thaw",(PyCFunction)py_an_thaw, METH_NOARGS, "Turns a loaded (read-only) index into a mutable in-memory one so that items can be added incrementally."},
+  {"get_n_nodes",(PyCFunction)py_an_get_n_nodes, METH_NOARGS, "Returns the number of nodes in the index."},
+  {"has_item",(PyCFunction)py_an_has_item, METH_VARARGS, "Returns whether item `i` has been added to the index."},
   {"on_disk_build",(PyCFunction)py_an_on_disk_build, METH_VARARGS | METH_KEYWORDS, "Build will be performed with storage on disk instead of RAM."},
-  {"build",(PyCFunction)py_an_build, METH_VARARGS | METH_KEYWORDS, "Builds a forest of `n_trees` trees.\n\nMore trees give higher precision when querying. After calling `build`,\nno more items can be added. `n_jobs` specifies the number of threads used to build the trees. `n_jobs=-1` uses all available CPU cores."},
+  {"build",(PyCFunction)py_an_build, METH_VARARGS | METH_KEYWORDS, "Builds a forest of `n_trees` trees.\n\nMore trees give higher precision when querying. After calling `build`,\nmore items can be added incrementally with `add_item`/`add_items`/`append_items`. `n_jobs` specifies the number of threads used to build the trees. `n_jobs=-1` uses all available CPU cores."},
   {"unbuild",(PyCFunction)py_an_unbuild, METH_NOARGS, "Unbuilds the tree in order to allows adding new items.\n\nbuild() has to be called again afterwards in order to\nrun queries."},
   {"unload",(PyCFunction)py_an_unload, METH_NOARGS, "Unloads an index from disk."},
   {"get_distance",(PyCFunction)py_an_get_distance, METH_VARARGS, "Returns the distance between items `i` and `j`."},

@@ -14,3 +14,4 @@
 
 # This module is a dummy wrapper around the underlying C++ module.
 from .annoylib import Annoy as AnnoyIndex
+from .incremental import IncrementalIndex

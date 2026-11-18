@@ -73,9 +73,12 @@ Full Python API
 
 * ``AnnoyIndex(f, metric)`` returns a new index that's read-write and stores vector of ``f`` dimensions. Metric can be ``"angular"``, ``"euclidean"``, ``"manhattan"``, ``"hamming"``, or ``"dot"``.
 * ``a.add_item(i, v)`` adds item ``i`` (any nonnegative integer) with vector ``v``. Note that it will allocate memory for ``max(i)+1`` items.
-* ``a.build(n_trees, n_jobs=-1)`` builds a forest of ``n_trees`` trees. More trees gives higher precision when querying. After calling ``build``, no more items can be added. ``n_jobs`` specifies the number of threads used to build the trees. ``n_jobs=-1`` uses all available CPU cores.
-* ``a.save(fn, prefault=False)`` saves the index to disk and loads it (see next function). After saving, no more items can be added.
+* ``a.add_items(items)`` adds a batch of ``(i, v)`` pairs atomically: the whole batch is validated before anything is inserted, and concurrent queries either see all of it or none of it. Duplicate item ids are overwritten (last write wins) with a warning.
+* ``a.append_items(vectors)`` appends a batch of vectors, allocates a fresh item id for each one (above the current item and node id space) and returns the allocated ids. Atomic like ``add_items``.
+* ``a.build(n_trees, n_jobs=-1)`` builds a forest of ``n_trees`` trees. More trees gives higher precision when querying. After calling ``build``, more items can still be added incrementally (see below). ``n_jobs`` specifies the number of threads used to build the trees. ``n_jobs=-1`` uses all available CPU cores.
+* ``a.save(fn, prefault=False)`` saves the index to disk and loads it (see next function). After saving, the index is loaded read-only; call ``a.thaw()`` to add more items.
 * ``a.load(fn, prefault=False)`` loads (mmaps) an index from disk. If `prefault` is set to `True`, it will pre-read the entire file into memory (using mmap with `MAP_POPULATE`). Default is `False`.
+* ``a.thaw()`` turns a loaded (read-only, mmapped) index into a mutable in-memory one so that items can be added incrementally.
 * ``a.unload()`` unloads.
 * ``a.get_nns_by_item(i, n, search_k=-1, include_distances=False)`` returns the ``n`` closest items. During the query it will inspect up to ``search_k`` nodes which defaults to ``n_trees * n`` if not provided. ``search_k`` gives you a run-time tradeoff between better accuracy and speed. If you set ``include_distances`` to ``True``, it will return a 2 element tuple with two lists in it: the second one containing all corresponding distances.
 * ``a.get_nns_by_vector(v, n, search_k=-1, include_distances=False)`` same but query by vector ``v``.
@@ -83,6 +86,8 @@ Full Python API
 * ``a.get_distance(i, j)`` returns the distance between items ``i`` and ``j``. NOTE: this used to return the *squared* distance, but has been changed as of Aug 2016.
 * ``a.get_n_items()`` returns the number of items in the index.
 * ``a.get_n_trees()`` returns the number of trees in the index.
+* ``a.get_n_nodes()`` returns the number of nodes in the index.
+* ``a.has_item(i)`` returns whether item ``i`` has been added to the index.
 * ``a.on_disk_build(fn)`` prepares annoy to build the index in the specified file instead of RAM (execute before adding items, no need to save after build)
 * ``a.set_seed(seed)`` will initialize the random number generator with the given seed.  Only used for building up the tree, i. e. only necessary to pass this before adding the items.  Will have no effect after calling `a.build(n_trees)` or `a.load(fn)`.
 
@@ -90,6 +95,15 @@ Notes:
 
 * There's no bounds checking performed on the values so be careful.
 * Annoy uses Euclidean distance of normalized vectors for its angular distance, which for two vectors u,v is equal to ``sqrt(2(1-cos(u,v)))``
+
+Incremental updates
+-------------------
+
+Items can be added to an already built index without a full rebuild. Each new item is descended into every existing tree and inserted into the leaf it belongs to (full leaves are re-split in place with the regular tree building code), so incremental items are spread over the whole forest and are searchable immediately. Existing item ids and vectors are never modified. Incrementally added items should use fresh ids above ``max(a.get_n_items(), a.get_n_nodes())`` — ``a.append_items(vectors)`` does this for you. Re-adding an existing id updates its vector in place (last write wins).
+
+A loaded index is read-only; call ``a.thaw()`` first to make it mutable. The saved file format is unchanged: an incrementally grown index can be loaded and queried exactly like a fully rebuilt one. To compact an incrementally grown index back into the plain full-build format, read the items out and build a fresh index — the ``IncrementalIndex`` helper class in ``annoy/incremental.py`` automates all of this, including atomic crash-safe saves with a backup of the previous file and automatic fallback to the backup if the main file is corrupt. See ``examples/incremental_demo.py`` for a full walkthrough.
+
+Note that ``unbuild()`` is not supported on an incrementally updated index; rebuild the items into a fresh index instead.
 
 
 The C++ API is very similar: just ``#include "annoylib.h"`` to get access to it.
