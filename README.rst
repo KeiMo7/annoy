@@ -74,8 +74,10 @@ Full Python API
 * ``AnnoyIndex(f, metric)`` returns a new index that's read-write and stores vector of ``f`` dimensions. Metric can be ``"angular"``, ``"euclidean"``, ``"manhattan"``, ``"hamming"``, or ``"dot"``.
 * ``a.add_item(i, v)`` adds item ``i`` (any nonnegative integer) with vector ``v``. Note that it will allocate memory for ``max(i)+1`` items.
 * ``a.build(n_trees, n_jobs=-1)`` builds a forest of ``n_trees`` trees. More trees gives higher precision when querying. After calling ``build``, no more items can be added. ``n_jobs`` specifies the number of threads used to build the trees. ``n_jobs=-1`` uses all available CPU cores.
-* ``a.save(fn, prefault=False)`` saves the index to disk and loads it (see next function). After saving, no more items can be added.
+* ``a.save(fn, prefault=False, legacy=False)`` saves the index with a 4 KiB metadata header and loads it (see next function). After saving, no more items can be added. Pass ``legacy=True`` (or ``format="legacy"``) to write the body-only format used by older Annoy releases.
 * ``a.load(fn, prefault=False)`` loads (mmaps) an index from disk. If `prefault` is set to `True`, it will pre-read the entire file into memory (using mmap with `MAP_POPULATE`). Default is `False`.
+* ``a.get_metadata()`` returns the loaded index's fingerprint: format version, dimension, metric, node size, item/tree counts, seed, and writer version. Legacy files are reported with ``metadata_present=False``.
+* ``read_index_metadata(fn, f=None, metric=None)`` reads only the 4 KiB header, without mmapping or loading the index body. It also validates optional caller dimension/metric values.
 * ``a.unload()`` unloads.
 * ``a.get_nns_by_item(i, n, search_k=-1, include_distances=False)`` returns the ``n`` closest items. During the query it will inspect up to ``search_k`` nodes which defaults to ``n_trees * n`` if not provided. ``search_k`` gives you a run-time tradeoff between better accuracy and speed. If you set ``include_distances`` to ``True``, it will return a 2 element tuple with two lists in it: the second one containing all corresponding distances.
 * ``a.get_nns_by_vector(v, n, search_k=-1, include_distances=False)`` same but query by vector ``v``.
@@ -85,6 +87,27 @@ Full Python API
 * ``a.get_n_trees()`` returns the number of trees in the index.
 * ``a.on_disk_build(fn)`` prepares annoy to build the index in the specified file instead of RAM (execute before adding items, no need to save after build)
 * ``a.set_seed(seed)`` will initialize the random number generator with the given seed.  Only used for building up the tree, i. e. only necessary to pass this before adding the items.  Will have no effect after calling `a.build(n_trees)` or `a.load(fn)`.
+
+Index compatibility and auditing
+--------------------------------
+
+New indexes store a fingerprint in a fixed 4 KiB header. The header records the metric, dimension, node/data sizes, format version, item and tree counts, seed, body length, and a CRC. ``load`` rejects dimension, metric, data-type, or node-layout mismatches before mapping the body. Parameter-validation errors include the file path plus caller and file parameter values.
+
+Legacy body-only indexes still load in compatibility mode and emit a ``RuntimeWarning``. Files without a valid header and with an invalid body length are reported as corrupted, not incompatible. A future format version is reported as unsupported.
+
+The new layout is also safe for older readers: the body remains page-aligned at offset 4096, and the trailing marker makes the total file length fail the legacy reader's node-size check before ``mmap``. Older readers therefore return their normal load error instead of parsing the metadata as nodes.
+
+Audit a directory before an upgrade:
+
+.. code-block:: python
+
+  from annoy import check_indexes, export_report_csv, format_report
+
+  report = check_indexes(paths, f=40, metric="angular", n_jobs=8)
+  print(format_report(report))
+  export_report_csv(report, "annoy-audit.csv")
+
+The result contains separate ``loadable`` and ``rebuild`` lists. Each entry includes dimension, metric, node size, format version, status, warning/error details, and a rebuild reason. Files are scanned concurrently and a single unreadable file does not abort the batch.
 
 Notes:
 

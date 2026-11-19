@@ -40,6 +40,8 @@ typedef signed __int64    int64_t;
  // a bit hacky, but override some definitions to support 64 bit
  #define off_t int64_t
  #define lseek_getsize(fd) _lseeki64(fd, 0, SEEK_END)
+ #define annoy_read(fd, buf, count) _read(fd, buf, (unsigned int)(count))
+ #define annoy_lseek(fd, offset, whence) _lseeki64(fd, offset, whence)
  #ifndef NOMINMAX
   #define NOMINMAX
  #endif
@@ -48,6 +50,8 @@ typedef signed __int64    int64_t;
 #else
  #include <sys/mman.h>
  #define lseek_getsize(fd) lseek(fd, 0, SEEK_END)
+ #define annoy_read(fd, buf, count) read(fd, buf, count)
+ #define annoy_lseek(fd, offset, whence) lseek(fd, offset, whence)
 #endif
 
 #include <cerrno>
@@ -57,6 +61,8 @@ typedef signed __int64    int64_t;
 #include <algorithm>
 #include <queue>
 #include <limits>
+#include <string>
+#include <stdarg.h>
 
 #if __cplusplus >= 201103L
 #include <type_traits>
@@ -138,6 +144,203 @@ inline void set_error_from_string(char **error, const char* msg) {
     *error = (char *)malloc(strlen(msg) + 1);
     strcpy(*error, msg);
   }
+}
+
+inline void set_error_from_format(char **error, const char* fmt, ...) {
+  char msg[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+  set_error_from_string(error, msg);
+}
+
+static const uint32_t ANNOY_METADATA_FORMAT_VERSION = 1;
+static const uint32_t ANNOY_METADATA_HEADER_SIZE = 4096;
+static const uint32_t ANNOY_METADATA_FLAG = 1;
+static const char ANNOY_METADATA_MAGIC[8] = {'A', 'N', 'N', 'O', 'Y', 'I', 'D', 'X'};
+static const char ANNOY_METADATA_TRAILER_MAGIC[8] = {'A', 'N', 'N', 'T', 'R', 'L', 'R', '1'};
+static const char ANNOY_METADATA_WRITER_VERSION[] = "1.17.3-metadata-v1";
+
+struct AnnoyMetadata {
+  uint32_t flags;
+  uint32_t format_version;
+  int32_t dimension;
+  uint32_t node_size;
+  uint32_t item_size;
+  uint32_t value_size;
+  uint64_t body_size;
+  uint64_t item_count;
+  uint32_t tree_count;
+  uint32_t trailer_size;
+  uint64_t seed;
+  std::string metric;
+  std::string writer_version;
+};
+
+inline uint32_t metadata_get_u32(const uint8_t* p) {
+  return ((uint32_t)p[0]) |
+         ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+
+inline uint64_t metadata_get_u64(const uint8_t* p) {
+  uint64_t value = 0;
+  for (int i = 7; i >= 0; i--)
+    value = (value << 8) | p[i];
+  return value;
+}
+
+inline void metadata_put_u32(uint8_t* p, uint32_t value) {
+  p[0] = (uint8_t)(value & 0xff);
+  p[1] = (uint8_t)((value >> 8) & 0xff);
+  p[2] = (uint8_t)((value >> 16) & 0xff);
+  p[3] = (uint8_t)((value >> 24) & 0xff);
+}
+
+inline void metadata_put_u64(uint8_t* p, uint64_t value) {
+  for (int i = 0; i < 8; i++) {
+    p[i] = (uint8_t)(value & 0xff);
+    value >>= 8;
+  }
+}
+
+inline uint32_t metadata_crc32(const uint8_t* data, size_t size) {
+  uint32_t crc = 0xffffffffu;
+  for (size_t i = 0; i < size; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++)
+      crc = (crc >> 1) ^ (0xedb88320u & (uint32_t)(-(int32_t)(crc & 1)));
+  }
+  return ~crc;
+}
+
+inline std::string metadata_to_string(uint32_t value) {
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "%u", value);
+  return std::string(buffer);
+}
+
+inline std::string metadata_get_string(const uint8_t* p, size_t size) {
+  size_t length = 0;
+  while (length < size && p[length] != '\0')
+    length++;
+  return std::string((const char*)p, length);
+}
+
+inline void metadata_put_string(uint8_t* p, size_t size, const std::string& value) {
+  memset(p, 0, size);
+  size_t length = value.size() < size - 1 ? value.size() : size - 1;
+  memcpy(p, value.data(), length);
+}
+
+inline bool metadata_has_magic(const uint8_t* header, size_t size) {
+  return size >= sizeof(ANNOY_METADATA_MAGIC) &&
+         memcmp(header, ANNOY_METADATA_MAGIC, sizeof(ANNOY_METADATA_MAGIC)) == 0;
+}
+
+inline bool metadata_has_trailer_magic(const uint8_t* tail, size_t size) {
+  if (size < sizeof(ANNOY_METADATA_TRAILER_MAGIC))
+    return false;
+  for (size_t i = 0; i + sizeof(ANNOY_METADATA_TRAILER_MAGIC) <= size; i++) {
+    if (memcmp(tail + i, ANNOY_METADATA_TRAILER_MAGIC,
+               sizeof(ANNOY_METADATA_TRAILER_MAGIC)) == 0)
+      return true;
+  }
+  return false;
+}
+
+inline bool metadata_parse_header(const uint8_t* header, size_t size, AnnoyMetadata* metadata,
+                                  std::string* error, std::string* kind) {
+  if (!metadata_has_magic(header, size)) {
+    if (kind) *kind = "legacy";
+    return false;
+  }
+  if (size < ANNOY_METADATA_HEADER_SIZE) {
+    if (kind) *kind = "corrupted";
+    if (error) *error = "corrupted metadata header: header is truncated";
+    return false;
+  }
+
+  uint32_t version = metadata_get_u32(header + 8);
+  uint32_t header_size = metadata_get_u32(header + 12);
+  if (version > ANNOY_METADATA_FORMAT_VERSION) {
+    if (kind) *kind = "unsupported";
+    if (error) {
+      char msg[256];
+      snprintf(msg, sizeof(msg),
+               "unsupported index format version %u (this reader supports version %u)",
+               version, ANNOY_METADATA_FORMAT_VERSION);
+      *error = msg;
+    }
+    return false;
+  }
+  if (version == 0 || header_size != ANNOY_METADATA_HEADER_SIZE) {
+    if (kind) *kind = "corrupted";
+    if (error) *error = "corrupted metadata header: invalid version or header size";
+    return false;
+  }
+
+  uint32_t stored_crc = metadata_get_u32(header + 16);
+  uint32_t actual_crc = metadata_crc32(header + 20, ANNOY_METADATA_HEADER_SIZE - 20);
+  if (stored_crc != actual_crc) {
+    if (kind) *kind = "corrupted";
+    if (error) *error = "corrupted metadata header: checksum mismatch";
+    return false;
+  }
+
+  metadata->flags = metadata_get_u32(header + 20);
+  metadata->format_version = version;
+  metadata->dimension = (int32_t)metadata_get_u32(header + 24);
+  metadata->node_size = metadata_get_u32(header + 28);
+  metadata->item_size = metadata_get_u32(header + 32);
+  metadata->value_size = metadata_get_u32(header + 36);
+  metadata->body_size = metadata_get_u64(header + 40);
+  metadata->item_count = metadata_get_u64(header + 48);
+  metadata->tree_count = metadata_get_u32(header + 56);
+  metadata->trailer_size = metadata_get_u32(header + 60);
+  metadata->seed = metadata_get_u64(header + 64);
+  metadata->metric = metadata_get_string(header + 72, 32);
+  metadata->writer_version = metadata_get_string(header + 104, 32);
+
+  if ((metadata->flags & ANNOY_METADATA_FLAG) == 0 ||
+      metadata->dimension <= 0 ||
+      metadata->node_size == 0 ||
+      metadata->item_size == 0 ||
+      metadata->value_size == 0 ||
+      metadata->body_size == 0 ||
+      metadata->body_size % metadata->node_size != 0 ||
+      metadata->trailer_size == 0 ||
+      metadata->trailer_size > 64 ||
+      metadata->metric.empty()) {
+    if (kind) *kind = "corrupted";
+    if (error) *error = "corrupted metadata header: invalid parameter fields";
+    return false;
+  }
+  if (kind) *kind = "ok";
+  return true;
+}
+
+inline void metadata_encode_header(uint8_t* header, const AnnoyMetadata& metadata) {
+  memset(header, 0, ANNOY_METADATA_HEADER_SIZE);
+  memcpy(header, ANNOY_METADATA_MAGIC, sizeof(ANNOY_METADATA_MAGIC));
+  metadata_put_u32(header + 8, ANNOY_METADATA_FORMAT_VERSION);
+  metadata_put_u32(header + 12, ANNOY_METADATA_HEADER_SIZE);
+  metadata_put_u32(header + 20, metadata.flags);
+  metadata_put_u32(header + 24, (uint32_t)metadata.dimension);
+  metadata_put_u32(header + 28, metadata.node_size);
+  metadata_put_u32(header + 32, metadata.item_size);
+  metadata_put_u32(header + 36, metadata.value_size);
+  metadata_put_u64(header + 40, metadata.body_size);
+  metadata_put_u64(header + 48, metadata.item_count);
+  metadata_put_u32(header + 56, metadata.tree_count);
+  metadata_put_u32(header + 60, metadata.trailer_size);
+  metadata_put_u64(header + 64, metadata.seed);
+  metadata_put_string(header + 72, 32, metadata.metric);
+  metadata_put_string(header + 104, 32, metadata.writer_version);
+  metadata_put_u32(header + 16,
+                   metadata_crc32(header + 20, ANNOY_METADATA_HEADER_SIZE - 20));
 }
 
 
@@ -910,8 +1113,14 @@ class AnnoyIndexInterface {
   virtual bool build(int q, int n_threads=-1, char** error=NULL) = 0;
   virtual bool unbuild(char** error=NULL) = 0;
   virtual bool save(const char* filename, bool prefault=false, char** error=NULL) = 0;
+  virtual bool save_legacy(const char* filename, bool prefault=false, char** error=NULL) = 0;
   virtual void unload() = 0;
   virtual bool load(const char* filename, bool prefault=false, char** error=NULL) = 0;
+  virtual size_t get_node_size() const = 0;
+  virtual const AnnoyMetadata& get_metadata() const = 0;
+  virtual bool has_metadata() const = 0;
+  virtual const char* get_load_warning() const = 0;
+  virtual const char* get_load_status() const = 0;
   virtual T get_distance(S i, S j) const = 0;
   virtual void get_nns_by_item(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
   virtual void get_nns_by_vector(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const = 0;
@@ -962,12 +1171,26 @@ protected:
   int _fd;
   bool _on_disk;
   bool _built;
+  void* _map_base;
+  size_t _mapped_size;
+  size_t _body_offset;
+  AnnoyMetadata _metadata;
+  bool _metadata_present;
+  int _metadata_f;
+  std::string _metadata_metric;
+  std::string _load_warning;
+  std::string _load_status;
 public:
 
-   AnnoyIndex(int f) : _f(f), _seed(Random::default_seed) {
+   AnnoyIndex(int f) : _f(f), _seed(Random::default_seed),
+                       _metadata_f(f), _metadata_metric(Distance::name()) {
     _s = offsetof(Node, v) + _f * sizeof(T); // Size of each node
     _verbose = false;
     _built = false;
+    _map_base = NULL;
+    _mapped_size = 0;
+    _body_offset = 0;
+    _metadata_present = false;
     _K = (S) (((size_t) (_s - offsetof(Node, children))) / sizeof(S)); // Max number of descendants to fit into node
     reinitialize(); // Reset everything
   }
@@ -977,6 +1200,33 @@ public:
 
   int get_f() const {
     return _f;
+  }
+
+  size_t get_node_size() const {
+    return _s;
+  }
+
+  const AnnoyMetadata& get_metadata() const {
+    return _metadata;
+  }
+
+  bool has_metadata() const {
+    return _metadata_present;
+  }
+
+  const char* get_load_warning() const {
+    return _load_warning.c_str();
+  }
+
+  const char* get_load_status() const {
+    return _load_status.c_str();
+  }
+
+  void set_metadata_identity(int f, const char* metric) {
+    _metadata_f = f;
+    _metadata_metric = metric;
+    _metadata.dimension = f;
+    _metadata.metric = metric;
   }
 
   bool add_item(S item, const T* w, char** error=NULL) {
@@ -1022,15 +1272,26 @@ public:
       return false;
     }
     _nodes_size = 1;
-    if (ftruncate(_fd, ANNOYLIB_FTRUNCATE_SIZE(_s) * ANNOYLIB_FTRUNCATE_SIZE(_nodes_size)) == -1) {
+    _body_offset = ANNOY_METADATA_HEADER_SIZE;
+    _metadata.trailer_size = _trailer_size_for_node_size(_s);
+    _mapped_size = _body_offset + _s * _nodes_size + _metadata.trailer_size;
+    if (ftruncate(_fd, ANNOYLIB_FTRUNCATE_SIZE(_mapped_size)) == -1) {
       set_error_from_errno(error, "Unable to truncate");
       return false;
     }
 #ifdef MAP_POPULATE
-    _nodes = (Node*) mmap(0, _s * _nodes_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, _fd, 0);
+    _map_base = mmap(0, _mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, _fd, 0);
 #else
-    _nodes = (Node*) mmap(0, _s * _nodes_size, PROT_READ | PROT_WRITE, MAP_SHARED, _fd, 0);
+    _map_base = mmap(0, _mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED, _fd, 0);
 #endif
+    if (_map_base == MAP_FAILED) {
+      set_error_from_errno(error, "Unable to mmap");
+      _map_base = NULL;
+      _mapped_size = 0;
+      return false;
+    }
+    _nodes = (Node*)((uint8_t*)_map_base + _body_offset);
+    _metadata_present = false;
     return true;
   }
     
@@ -1061,9 +1322,7 @@ public:
     if (_verbose) annoylib_showUpdate("has %d nodes\n", _n_nodes);
     
     if (_on_disk) {
-      if (!remap_memory_and_truncate(&_nodes, _fd,
-          static_cast<size_t>(_s) * static_cast<size_t>(_nodes_size),
-          static_cast<size_t>(_s) * static_cast<size_t>(_n_nodes))) {
+      if (!_resize_on_disk(_n_nodes)) {
         // TODO: this probably creates an index in a corrupt state... not sure what to do
         set_error_from_errno(error, "Unable to truncate");
         return false;
@@ -1074,6 +1333,8 @@ public:
     D::template postprocess<T, S, Node>(_nodes, _s, _n_items, _f);
 
     _built = true;
+    if (_on_disk && !_write_metadata_to_mapping(error))
+      return false;
     return true;
   }
   
@@ -1091,11 +1352,19 @@ public:
   }
 
   bool save(const char* filename, bool prefault=false, char** error=NULL) {
+    return _save(filename, prefault, false, error);
+  }
+
+  bool save_legacy(const char* filename, bool prefault=false, char** error=NULL) {
+    return _save(filename, prefault, true, error);
+  }
+
+  bool _save(const char* filename, bool prefault, bool legacy, char** error) {
     if (!_built) {
       set_error_from_string(error, "You can't save an index that hasn't been built");
       return false;
     }
-    if (_on_disk) {
+    if (_on_disk && !legacy) {
       return true;
     } else {
       // Delete file if it already exists (See issue #335)
@@ -1111,8 +1380,24 @@ public:
         return false;
       }
 
-      if (fwrite(_nodes, _s, _n_nodes, f) != (size_t) _n_nodes) {
+      bool write_ok = true;
+      if (!legacy) {
+        _populate_metadata();
+        uint8_t header[ANNOY_METADATA_HEADER_SIZE];
+        metadata_encode_header(header, _metadata);
+        write_ok = fwrite(header, 1, sizeof(header), f) == sizeof(header);
+      }
+      if (write_ok)
+        write_ok = fwrite(_nodes, _s, _n_nodes, f) == (size_t) _n_nodes;
+      if (write_ok && !legacy) {
+        uint8_t trailer[64];
+        memset(trailer, 0, sizeof(trailer));
+        memcpy(trailer, ANNOY_METADATA_TRAILER_MAGIC, sizeof(ANNOY_METADATA_TRAILER_MAGIC));
+        write_ok = fwrite(trailer, 1, _metadata.trailer_size, f) == _metadata.trailer_size;
+      }
+      if (!write_ok) {
         set_error_from_errno(error, "Unable to write");
+        fclose(f);
         return false;
       }
 
@@ -1134,34 +1419,45 @@ public:
     _n_nodes = 0;
     _nodes_size = 0;
     _on_disk = false;
+    _map_base = NULL;
+    _mapped_size = 0;
+    _body_offset = 0;
+    _metadata_present = false;
+    _metadata = AnnoyMetadata();
+    _metadata.dimension = _metadata_f;
+    _metadata.metric = _metadata_metric;
+    _load_warning.clear();
+    _load_status.clear();
     _seed = Random::default_seed;
     _roots.clear();
   }
 
   void unload() {
-    if (_on_disk && _fd) {
+    if (_fd) {
 #ifndef _MSC_VER
       close(_fd);
 #else
       _close(_fd);
 #endif
-      munmap(_nodes, _s * _nodes_size);
-    } else {
-      if (_fd) {
-        // we have mmapped data
-#ifndef _MSC_VER
-        close(_fd);
-#else
-        _close(_fd);
-#endif
-        munmap(_nodes, _n_nodes * _s);
-      } else if (_nodes) {
-        // We have heap allocated data
-        free(_nodes);
-      }
+      if (_map_base)
+        munmap(_map_base, _mapped_size);
+    } else if (_nodes) {
+      // We have heap allocated data
+      free(_nodes);
     }
     reinitialize();
     if (_verbose) annoylib_showUpdate("unloaded\n");
+  }
+
+  void _close_fd() {
+    if (_fd) {
+#ifndef _MSC_VER
+      close(_fd);
+#else
+      _close(_fd);
+#endif
+      _fd = 0;
+    }
   }
 
   bool load(const char* filename, bool prefault=false, char** error=NULL) {
@@ -1171,20 +1467,23 @@ public:
     _fd = _open(filename, _O_RDONLY, (int)0400);
 #endif
     if (_fd == -1) {
-      set_error_from_errno(error, "Unable to open");
+      set_error_from_format(error, "Unable to open index '%s': %s (%d)",
+                            filename, strerror(errno), errno);
       _fd = 0;
+      _load_status = "unreadable";
       return false;
     }
     off_t size = lseek_getsize(_fd);
     if (size == -1) {
-      set_error_from_errno(error, "Unable to get size");
+      _close_fd();
+      set_error_from_format(error, "Unable to get size of index '%s': %s (%d)",
+                            filename, strerror(errno), errno);
+      _load_status = "unreadable";
       return false;
     } else if (size == 0) {
-      set_error_from_errno(error, "Size of file is zero");
-      return false;
-    } else if (size % _s) {
-      // Something is fishy with this index!
-      set_error_from_errno(error, "Index size is not a multiple of vector size. Ensure you are opening using the same metric you used to create the index.");
+      _close_fd();
+      set_error_from_format(error, "Corrupted index '%s': file is empty", filename);
+      _load_status = "corrupted";
       return false;
     }
 
@@ -1196,8 +1495,144 @@ public:
       annoylib_showUpdate("prefault is set to true, but MAP_POPULATE is not defined on this platform");
 #endif
     }
-    _nodes = (Node*)mmap(0, size, PROT_READ, flags, _fd, 0);
-    _n_nodes = (S)(size / _s);
+
+    uint8_t header[ANNOY_METADATA_HEADER_SIZE];
+    size_t header_bytes = (size_t)size < sizeof(header) ? (size_t)size : sizeof(header);
+    memset(header, 0, sizeof(header));
+    if (annoy_lseek(_fd, 0, SEEK_SET) == (off_t)-1) {
+      _close_fd();
+      set_error_from_format(error, "Unable to seek in index '%s': %s (%d)",
+                            filename, strerror(errno), errno);
+      _load_status = "unreadable";
+      return false;
+    }
+    if (annoy_read(_fd, header, header_bytes) != (off_t)header_bytes) {
+      _close_fd();
+      set_error_from_format(error, "Unable to read index header '%s': %s (%d)",
+                            filename, strerror(errno), errno);
+      _load_status = "unreadable";
+      return false;
+    }
+    uint8_t tail[16];
+    memset(tail, 0, sizeof(tail));
+    size_t tail_bytes = (size_t)size < sizeof(tail) ? (size_t)size : sizeof(tail);
+    bool has_trailer = false;
+    if (tail_bytes > 0 &&
+        annoy_lseek(_fd, size - (off_t)tail_bytes, SEEK_SET) != (off_t)-1 &&
+        annoy_read(_fd, tail, tail_bytes) == (off_t)tail_bytes)
+      has_trailer = metadata_has_trailer_magic(tail, tail_bytes);
+
+    size_t body_offset = 0;
+    size_t body_size = (size_t)size;
+    if (metadata_has_magic(header, header_bytes)) {
+      AnnoyMetadata metadata;
+      std::string parse_error;
+      std::string parse_kind;
+      if (!metadata_parse_header(header, header_bytes, &metadata, &parse_error, &parse_kind)) {
+        _close_fd();
+        if (parse_kind == "unsupported")
+          set_error_from_format(error, "Unsupported index '%s': %s", filename, parse_error.c_str());
+        else
+          set_error_from_format(error, "Corrupted index '%s': %s", filename, parse_error.c_str());
+        _load_status = parse_kind == "unsupported" ? "unsupported" : "corrupted";
+        return false;
+      }
+      bool compatible = metadata.dimension == _metadata_f &&
+                        metadata.metric == _metadata_metric &&
+                        metadata.node_size == (uint32_t)_s &&
+                        metadata.item_size == (uint32_t)sizeof(S) &&
+                        metadata.value_size == (uint32_t)sizeof(T);
+      if (!compatible) {
+        _close_fd();
+        set_error_from_format(
+            error,
+            "Index parameter mismatch for '%s': caller dimension=%d metric='%s' node_size=%zu item_size=%zu value_size=%zu; "
+            "file dimension=%d metric='%s' node_size=%u item_size=%u value_size=%u",
+            filename, _metadata_f, _metadata_metric.c_str(), _s, sizeof(S), sizeof(T),
+            metadata.dimension, metadata.metric.c_str(), metadata.node_size,
+            metadata.item_size, metadata.value_size);
+        _load_status = "incompatible";
+        return false;
+      }
+
+      uint64_t expected_size = (uint64_t)ANNOY_METADATA_HEADER_SIZE +
+                               metadata.body_size + metadata.trailer_size;
+      if ((uint64_t)size < expected_size) {
+        _close_fd();
+        set_error_from_format(
+            error,
+            "Corrupted index '%s': file is truncated (expected at least %llu bytes, actual %llu bytes)",
+            filename, (unsigned long long)expected_size, (unsigned long long)size);
+        _load_status = "corrupted";
+        return false;
+      }
+      if ((uint64_t)size != expected_size) {
+        _close_fd();
+        set_error_from_format(
+            error,
+            "Corrupted index '%s': unexpected trailing data (header declares %llu bytes, actual %llu bytes)",
+            filename, (unsigned long long)expected_size, (unsigned long long)size);
+        _load_status = "corrupted";
+        return false;
+      }
+      if (!has_trailer) {
+        _close_fd();
+        set_error_from_format(
+            error,
+            "Corrupted index '%s': metadata header is valid but the format trailer is missing",
+            filename);
+        _load_status = "corrupted";
+        return false;
+      }
+      body_offset = ANNOY_METADATA_HEADER_SIZE;
+      body_size = (size_t)metadata.body_size;
+      _metadata = metadata;
+      _metadata_present = true;
+    } else {
+      if (has_trailer) {
+        _close_fd();
+        set_error_from_format(
+            error,
+            "Corrupted index '%s': metadata header magic is damaged but the new-format "
+            "trailer is present",
+            filename);
+        _load_status = "corrupted";
+        return false;
+      }
+      if (size % _s) {
+        _close_fd();
+        set_error_from_format(
+            error,
+            "Corrupted index '%s': size %llu is not a multiple of node size %zu "
+            "(header is damaged or caller dimension/metric does not match the file)",
+            filename, (unsigned long long)size, _s);
+        _load_status = "corrupted";
+        return false;
+      }
+      _metadata = AnnoyMetadata();
+      _metadata.dimension = _metadata_f;
+      _metadata.metric = _metadata_metric;
+      _metadata.node_size = (uint32_t)_s;
+      _metadata.item_size = (uint32_t)sizeof(S);
+      _metadata.value_size = (uint32_t)sizeof(T);
+      _metadata.body_size = (uint64_t)size;
+      _metadata.writer_version = "legacy";
+      _metadata_present = false;
+    }
+
+    _map_base = mmap(0, (size_t)size, PROT_READ, flags, _fd, 0);
+    if (_map_base == MAP_FAILED) {
+      _map_base = NULL;
+      _close_fd();
+      set_error_from_format(error, "Unable to mmap index '%s': %s (%d)",
+                            filename, strerror(errno), errno);
+      _load_status = "unreadable";
+      return false;
+    }
+    _mapped_size = (size_t)size;
+    _body_offset = body_offset;
+    _nodes = (Node*)((uint8_t*)_map_base + _body_offset);
+    _n_nodes = (S)(body_size / _s);
 
     // Find the roots by scanning the end of the file and taking the nodes with most descendants
     _roots.clear();
@@ -1217,6 +1652,40 @@ public:
     _loaded = true;
     _built = true;
     _n_items = m;
+    if (_metadata_present) {
+      if ((uint64_t)m != _metadata.item_count) {
+        char mismatch[1024];
+        snprintf(
+            mismatch, sizeof(mismatch),
+            "Corrupted index '%s': metadata declares items=%llu, "
+            "but index body contains items=%llu",
+            filename, (unsigned long long)_metadata.item_count, (unsigned long long)m);
+        unload();
+        set_error_from_string(error, mismatch);
+        _load_status = "corrupted";
+        return false;
+      }
+      _load_status = _metadata.format_version < ANNOY_METADATA_FORMAT_VERSION
+                       ? "compatible" : "current";
+      if (_metadata.format_version < ANNOY_METADATA_FORMAT_VERSION) {
+        _load_warning = "Index '" + std::string(filename) + "' uses format version " +
+                        metadata_to_string(_metadata.format_version) +
+                        "; loaded in compatibility mode";
+      } else {
+        _load_warning.clear();
+      }
+    } else {
+      _metadata.item_count = (uint64_t)m;
+      _metadata.tree_count = (uint32_t)_roots.size();
+      _metadata.body_size = (uint64_t)body_size;
+      _load_status = "legacy";
+      char warning[512];
+      snprintf(warning, sizeof(warning),
+               "Legacy index '%s' has no parameter metadata; loaded in compatibility mode "
+               "(caller dimension=%d, metric='%s', node_size=%zu). Rebuild to add a fingerprint.",
+               filename, _metadata_f, _metadata_metric.c_str(), _s);
+      _load_warning = warning;
+    }
     if (_verbose) annoylib_showUpdate("found %zu roots with degree %d\n", _roots.size(), m);
     return true;
   }
@@ -1296,15 +1765,66 @@ public:
   }
 
 protected:
+  size_t _trailer_size_for_node_size(size_t node_size) const {
+    size_t trailer_size = sizeof(ANNOY_METADATA_TRAILER_MAGIC) + 1;
+    if (node_size > 1 &&
+        (ANNOY_METADATA_HEADER_SIZE + trailer_size) % node_size == 0)
+      trailer_size++;
+    return trailer_size;
+  }
+
+  bool _resize_on_disk(S nodes_size) {
+    size_t body_size = (size_t)_s * (size_t)nodes_size;
+    size_t new_mapped_size = ANNOY_METADATA_HEADER_SIZE + body_size + _metadata.trailer_size;
+    if (!remap_memory_and_truncate(&_map_base, _fd, _mapped_size, new_mapped_size))
+      return false;
+    _mapped_size = new_mapped_size;
+    _body_offset = ANNOY_METADATA_HEADER_SIZE;
+    _nodes = (Node*)((uint8_t*)_map_base + _body_offset);
+    return true;
+  }
+
+  void _populate_metadata() {
+    _metadata = AnnoyMetadata();
+    _metadata.flags = ANNOY_METADATA_FLAG;
+    _metadata.format_version = ANNOY_METADATA_FORMAT_VERSION;
+    _metadata.dimension = _metadata_f;
+    _metadata.node_size = (uint32_t)_s;
+    _metadata.item_size = (uint32_t)sizeof(S);
+    _metadata.value_size = (uint32_t)sizeof(T);
+    _metadata.body_size = (uint64_t)_s * (uint64_t)_n_nodes;
+    _metadata.item_count = (uint64_t)_n_items;
+    _metadata.tree_count = (uint32_t)_roots.size();
+    _metadata.trailer_size = (uint32_t)_trailer_size_for_node_size(_s);
+    _metadata.seed = (uint64_t)_seed;
+    _metadata.metric = _metadata_metric;
+    _metadata.writer_version = ANNOY_METADATA_WRITER_VERSION;
+  }
+
+  bool _write_metadata_to_mapping(char** error) {
+    _populate_metadata();
+    uint8_t header[ANNOY_METADATA_HEADER_SIZE];
+    metadata_encode_header(header, _metadata);
+    memcpy(_map_base, header, sizeof(header));
+    uint8_t trailer[64];
+    memset(trailer, 0, sizeof(trailer));
+    memcpy(trailer, ANNOY_METADATA_TRAILER_MAGIC, sizeof(ANNOY_METADATA_TRAILER_MAGIC));
+    memcpy((uint8_t*)_map_base + ANNOY_METADATA_HEADER_SIZE + _metadata.body_size,
+           trailer, _metadata.trailer_size);
+    _metadata_present = true;
+    _load_status = "current";
+    _load_warning.clear();
+    if (error) *error = NULL;
+    return true;
+  }
+
   void _reallocate_nodes(S n) {
     const double reallocation_factor = 1.3;
     S new_nodes_size = std::max(n, (S) ((_nodes_size + 1) * reallocation_factor));
     void *old = _nodes;
     
     if (_on_disk) {
-      if (!remap_memory_and_truncate(&_nodes, _fd, 
-          static_cast<size_t>(_s) * static_cast<size_t>(_nodes_size), 
-          static_cast<size_t>(_s) * static_cast<size_t>(new_nodes_size)) && 
+      if (!_resize_on_disk(new_nodes_size) &&
           _verbose)
           annoylib_showUpdate("File truncation error\n");
     } else {
