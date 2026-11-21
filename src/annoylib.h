@@ -57,6 +57,8 @@ typedef signed __int64    int64_t;
 #include <algorithm>
 #include <queue>
 #include <limits>
+#include <fstream>
+#include <string>
 
 #if __cplusplus >= 201103L
 #include <type_traits>
@@ -66,6 +68,10 @@ typedef signed __int64    int64_t;
 #include <thread>
 #include <mutex>
 #include <shared_mutex>
+#endif
+
+#if !defined(_MSC_VER)
+#include <sys/file.h>
 #endif
 
 #ifdef _MSC_VER
@@ -145,6 +151,206 @@ using std::vector;
 using std::pair;
 using std::numeric_limits;
 using std::make_pair;
+
+// Dynamic-index (delete / update / append) on-disk format.
+//
+// Legacy files are a bare sequence of fixed-size nodes, so their size is
+// always a multiple of the node size. The dynamic format keeps the node
+// sequence byte-identical at the front and appends:
+//
+//   [nodes][deleted section][shadowed section][appended-deleted section]
+//          [appended external ids][footer][8-byte magic]
+//
+// Each section is a sparse, self-describing bitmap encoding:
+//   kind 0: empty, no payload
+//   kind 1: int64 count followed by `count` sorted S (int32) ids
+//   kind 2: int64 span followed by ceil(span/8) raw bitmap bytes
+// The writer picks whichever representation is smallest for its density.
+//
+// The trailing magic makes the total file size a non-multiple of the node
+// size, so old readers reject the file with the existing size-mismatch
+// error instead of misinterpreting the trailer as nodes.
+static const uint32_t ANNOY_DYNAMIC_FORMAT_VERSION = 2;
+static const char ANNOY_DYNAMIC_MAGIC[8] = {'A', 'N', 'N', 'O', 'Y', 'D', 'Y', 'N'};
+
+#pragma pack(push, 1)
+struct AnnoyIndexFooter {
+  uint32_t magic_cookie;       // 0x414e4e31 ("ANN1"), distinguishes a footer from padding
+  uint32_t format_version;     // ANNOY_DYNAMIC_FORMAT_VERSION
+  uint32_t dimensions;         // _f, validated against the opening index
+  uint32_t metric_tag;         // hash of Distance::name(), validated on load
+  int64_t  node_count;         // total fixed-size node records (tree nodes + appended nodes)
+  int64_t  tree_node_count;    // node slots occupied by the built trees; appends start here
+  int64_t  n_items;            // external-id span at build time (legacy _n_items semantics)
+  int64_t  n_appended;         // number of appended (post-build) nodes
+  int64_t  trailer_bytes;      // exact size of everything after the node records
+  uint32_t crc32;              // crc32 over all preceding footer fields
+  uint32_t reserved;
+};
+#pragma pack(pop)
+
+inline uint32_t annoy_crc32(const uint8_t* data, size_t len, uint32_t crc = 0xffffffff) {
+  // Table-free CRC-32 (IEEE polynomial), avoids a zlib dependency.
+  crc = ~crc;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int b = 0; b < 8; b++)
+      crc = (crc >> 1) ^ (0xedb88320u & (uint32_t)(-(int32_t)(crc & 1)));
+  }
+  return ~crc;
+}
+
+// FNV-1a so the metric name travels without exporting any enum across bindings.
+inline uint32_t annoy_metric_tag(const char* name) {
+  uint32_t h = 0x811c9dc5u;
+  for (const char* p = name; *p; p++) {
+    h ^= (uint8_t)*p;
+    h *= 0x01000193u;
+  }
+  return h;
+}
+
+// Sparse bitmap serialization. kind 0 empty / 1 sorted id list / 2 dense bitmap.
+enum AnnoyBitmapKind { ANNOY_BM_EMPTY = 0, ANNOY_BM_IDS = 1, ANNOY_BM_DENSE = 2 };
+
+inline size_t annoy_sparse_encoded_size(size_t set_bits, size_t span) {
+  size_t list_bytes = sizeof(int64_t) + sizeof(int32_t) * set_bits;
+  size_t dense_bytes = sizeof(int64_t) + (span + 7) / 8;
+  if (set_bits == 0) return sizeof(int32_t);
+  return sizeof(int32_t) + std::min(list_bytes, dense_bytes);
+}
+
+// Encode the set bits of `bm` over logical span `span`; appends to `out`.
+// Only bits below `span` are considered.
+inline void annoy_sparse_write(vector<uint8_t>* out, const vector<uint8_t>& bm, size_t span) {
+  vector<int32_t> ids;
+  for (size_t i = 0; i < span; i++) {
+    size_t byte = i >> 3;
+    if (byte < bm.size() && ((bm[byte] >> (i & 7)) & 1u))
+      ids.push_back((int32_t)i);
+  }
+  size_t list_bytes = sizeof(int64_t) + sizeof(int32_t) * ids.size();
+  size_t dense_bytes = sizeof(int64_t) + (span + 7) / 8;
+  if (ids.empty()) {
+    int32_t kind = (int32_t)ANNOY_BM_EMPTY;
+    uint8_t* p = (uint8_t*)&kind;
+    out->insert(out->end(), p, p + sizeof(kind));
+    return;
+  }
+  if (list_bytes <= dense_bytes) {
+    int32_t kind = (int32_t)ANNOY_BM_IDS;
+    int64_t count = (int64_t)ids.size();
+    out->insert(out->end(), (uint8_t*)&kind, (uint8_t*)&kind + sizeof(kind));
+    out->insert(out->end(), (uint8_t*)&count, (uint8_t*)&count + sizeof(count));
+    out->insert(out->end(), (uint8_t*)&ids[0],
+                (uint8_t*)&ids[0] + ids.size() * sizeof(int32_t));
+  } else {
+    int32_t kind = (int32_t)ANNOY_BM_DENSE;
+    int64_t sp = (int64_t)span;
+    out->insert(out->end(), (uint8_t*)&kind, (uint8_t*)&kind + sizeof(kind));
+    out->insert(out->end(), (uint8_t*)&sp, (uint8_t*)&sp + sizeof(sp));
+    size_t nbytes = (span + 7) / 8;
+    out->insert(out->end(), nbytes, 0);
+    for (size_t i = 0; i < ids.size(); i++) {
+      size_t bit = (size_t)ids[i];
+      (*out)[out->size() - nbytes + (bit >> 3)] |= (uint8_t)(1u << (bit & 7));
+    }
+  }
+}
+
+struct AnnoySparseSection {
+  vector<uint8_t> bits; // dense, resized by caller to the logical span
+  size_t bytes_consumed;
+};
+
+// Decode one sparse section starting at `p` (at least `remaining` bytes left).
+// On success returns true, fills `out` (a dense bitmap of `span` bytes/8) and
+// the number of bytes consumed.
+inline bool annoy_sparse_read(const uint8_t* p, size_t remaining, size_t span,
+                              vector<uint8_t>* out, size_t* consumed, char** error) {
+  out->assign((span + 7) / 8, 0);
+  if (remaining < sizeof(int32_t)) {
+    set_error_from_string(error, "Truncated bitmap section in index");
+    return false;
+  }
+  int32_t kind;
+  memcpy(&kind, p, sizeof(kind));
+  p += sizeof(kind);
+  remaining -= sizeof(kind);
+  size_t used = sizeof(kind);
+  if (kind == (int32_t)ANNOY_BM_EMPTY) {
+    *consumed = used;
+    return true;
+  }
+  if (remaining < sizeof(int64_t)) {
+    set_error_from_string(error, "Truncated bitmap section in index");
+    return false;
+  }
+  int64_t head;
+  memcpy(&head, p, sizeof(head));
+  p += sizeof(head);
+  remaining -= sizeof(head);
+  used += sizeof(head);
+  if (kind == (int32_t)ANNOY_BM_IDS) {
+    size_t count = (size_t)head;
+    size_t need = count * sizeof(int32_t);
+    if (remaining < need) {
+      set_error_from_string(error, "Truncated id list in index");
+      return false;
+    }
+    for (size_t i = 0; i < count; i++) {
+      int32_t id;
+      memcpy(&id, p + i * sizeof(int32_t), sizeof(id));
+      if ((size_t)id >= span) {
+        set_error_from_string(error, "Bitmap id exceeds index span");
+        return false;
+      }
+      (*out)[(size_t)id >> 3] |= (uint8_t)(1u << (id & 7));
+    }
+    *consumed = used + need;
+    return true;
+  }
+  if (kind == (int32_t)ANNOY_BM_DENSE) {
+    size_t sp = (size_t)head;
+    if (sp != span) {
+      set_error_from_string(error, "Bitmap span does not match index metadata");
+      return false;
+    }
+    size_t nbytes = (sp + 7) / 8;
+    if (remaining < nbytes) {
+      set_error_from_string(error, "Truncated dense bitmap in index");
+      return false;
+    }
+    memcpy(&(*out)[0], p, nbytes);
+    *consumed = used + nbytes;
+    return true;
+  }
+  set_error_from_string(error, "Unknown bitmap encoding in index");
+  return false;
+}
+
+// Dummy mutex used by the single-threaded build policy so the same
+// guard code compiles in both configurations.
+struct AnnoyNoopMutex {
+  void lock() {}
+  void unlock() {}
+  void lock_shared() {}
+  void unlock_shared() {}
+};
+
+// RAII guards with the same interface regardless of C++ standard level.
+template<typename M>
+struct SharedGuardT {
+  M& _m;
+  explicit SharedGuardT(M& m) : _m(m) { m.lock_shared(); }
+  ~SharedGuardT() { _m.unlock_shared(); }
+};
+template<typename M>
+struct UniqueGuardT {
+  M& _m;
+  explicit UniqueGuardT(M& m) : _m(m) { m.lock(); }
+  ~UniqueGuardT() { _m.unlock(); }
+};
 
 inline bool remap_memory_and_truncate(void** _ptr, int _fd, size_t old_size, size_t new_size) {
 #ifdef __linux__
@@ -921,6 +1127,16 @@ class AnnoyIndexInterface {
   virtual void get_item(S item, T* v) const = 0;
   virtual void set_seed(R q) = 0;
   virtual bool on_disk_build(const char* filename, char** error=NULL) = 0;
+  // Dynamic index operations. All item ids keep their external, stable numbering.
+  virtual bool delete_item(S item, bool must_exist, char** error=NULL) = 0;
+  virtual bool delete_items(const vector<S>& items, bool must_exist, S* missing, char** error=NULL) = 0;
+  virtual bool update_item(S item, const T* w, char** error=NULL) = 0;
+  virtual bool load_mutable(const char* filename, bool prefault=false, char** error=NULL) = 0;
+  virtual S get_n_active_items() const = 0;
+  virtual S get_n_appended_items() const = 0;
+  virtual double get_deleted_fraction() const = 0;
+  virtual bool item_exists(S item) const = 0;
+  virtual bool compact(const char* filename, int n_trees, int n_jobs, char** error=NULL) = 0;
 };
 
 template<typename S, typename T, typename Distance, typename Random, class ThreadedBuildPolicy>
@@ -962,6 +1178,25 @@ protected:
   int _fd;
   bool _on_disk;
   bool _built;
+  // Dynamic-index state
+  vector<uint8_t> _deleted;      // runtime in-span dead view: legacy holes + explicit tombstones
+  vector<uint8_t> _explicit_del; // explicit delete_item() calls only; this is what we persist
+  vector<uint8_t> _shadowed;     // in-span slot replaced by a newer appended node (same external id)
+  vector<uint8_t> _appended_del; // bitmap over appended nodes [0, _n_appended)
+  vector<S> _appended_ids;       // external id of each appended node
+  S _n_appended;
+  S _tree_nodes;                 // value of _n_nodes at build time; append boundary
+  S _active_count;               // live items among [0, _n_items)
+  bool _read_only;               // true for load(); mutations are rejected
+  bool _mutated;                 // any delete/update/append since build/load
+  size_t _mmap_size;             // actual mapped size (file size for v2 includes trailer)
+#ifdef ANNOYLIB_MULTITHREADED_BUILD
+  mutable std::shared_timed_mutex _dyn_mutex;
+  typedef std::shared_timed_mutex DynMutex;
+#else
+  mutable AnnoyNoopMutex _dyn_mutex;
+  typedef AnnoyNoopMutex DynMutex;
+#endif
 public:
 
    AnnoyIndex(int f) : _f(f), _seed(Random::default_seed) {
@@ -985,6 +1220,11 @@ public:
 
   template<typename W>
   bool add_item_impl(S item, const W& w, char** error=NULL) {
+    if (_built) {
+      // Post-build mutation: append the node without touching the existing
+      // trees, or reactivate a previously deleted slot.
+      return _add_item_dynamic(item, w, error);
+    }
     if (_loaded) {
       set_error_from_string(error, "You can't add an item to a loaded index");
       return false;
@@ -1008,6 +1248,143 @@ public:
 
     return true;
   }
+
+  // ---- Dynamic index: tombstones ---------------------------------------
+  static inline bool _bitmap_get(const vector<uint8_t>& bm, S i) {
+    size_t byte = (size_t)i >> 3;
+    if (byte >= bm.size()) return false; // pre-build state: no tombstones exist yet
+    return (bm[byte] >> (i & 7)) & 1;
+  }
+  static inline void _bitmap_set(vector<uint8_t>& bm, S i) {
+    bm[(size_t)i >> 3] |= (uint8_t)(1u << (i & 7));
+  }
+  static inline void _bitmap_clear(vector<uint8_t>& bm, S i) {
+    bm[(size_t)i >> 3] &= (uint8_t)~(1u << (i & 7));
+  }
+  void _bitmap_resize(vector<uint8_t>& bm, S n) {
+    bm.resize(((size_t)n + 7) / 8, 0);
+  }
+  // Resolve an external id to a live node slot, or -1 if it is gone/unknown.
+  // Appended nodes take precedence: they represent the newest vector written
+  // for an id that used to occupy an in-span slot.
+  S _resolve_slot(S item) const {
+    for (S k = 0; k < _n_appended; k++) {
+      if (_appended_ids[k] == item && !_bitmap_get(_appended_del, k))
+        return _tree_nodes + k;
+    }
+    if (item >= 0 && item < _n_items &&
+        !_bitmap_get(_deleted, item) && !_bitmap_get(_shadowed, item))
+      return item;
+    return -1;
+  }
+
+protected:
+  // In-memory bitmaps share one length for the larger of the two id spaces.
+  void _sync_bitmap_sizes() {
+    size_t need = std::max(((size_t)_n_items + 7) / 8,
+                           ((size_t)_n_appended + 7) / 8);
+    _deleted.resize(need, 0);
+    _explicit_del.resize(need, 0);
+    _shadowed.resize(need, 0);
+    _appended_del.resize(need, 0);
+  }
+
+  // Allocate one appended node holding (item, w). The caller has already
+  // validated the id and all state transitions.
+  void _append_new_node(S item, const T* w) {
+    S slot = _tree_nodes + _n_appended;
+    _allocate_size(slot + 1);
+    Node* n = _get(slot);
+    D::zero_value(n);
+    n->children[0] = 0;
+    n->children[1] = 0;
+    n->n_descendants = 1;
+    for (int z = 0; z < _f; z++)
+      n->v[z] = w[z];
+    D::init_node(n, _f);
+    _mark_appended_built(n);
+    _appended_ids.push_back(item);
+    _n_appended++;
+    _sync_bitmap_sizes();
+    // Keep _n_nodes covering the whole occupied node region so save() writes
+    // appended nodes as well (tree boundary is tracked separately in _tree_nodes).
+    _n_nodes = _tree_nodes + _n_appended;
+  }
+
+  template<typename W>
+  bool _add_item_dynamic(S item, const W& w, char** error) {
+    if (_read_only) {
+      set_error_from_string(error,
+          "Index was opened with load() (read-only). Reopen with load_mutable() to modify it.");
+      return false;
+    }
+    if (item < 0) {
+      set_error_from_string(error, "Item index can not be negative");
+      return false;
+    }
+
+    // An existing live version of this id?
+    for (S k = 0; k < _n_appended; k++) {
+      if (_appended_ids[k] == item) {
+        if (!_bitmap_get(_appended_del, k)) {
+          set_error_from_string(error,
+              "Item already exists. Use update_item() to replace its vector.");
+          return false;
+        }
+        // Reactivate a previously deleted appended node in place.
+        Node* n = _get(_tree_nodes + k);
+        D::zero_value(n);
+        n->children[0] = 0;
+        n->children[1] = 0;
+        n->n_descendants = 1;
+        for (int z = 0; z < _f; z++)
+          n->v[z] = w[z];
+        D::init_node(n, _f);
+        _mark_appended_built(n);
+        _bitmap_clear(_appended_del, k);
+        // The id is live again through this append-region node.
+        if (item < _n_items)
+          _bitmap_clear(_explicit_del, item);
+        _active_count++;
+        _mutated = true;
+        return true;
+      }
+    }
+
+    if (item < _n_items) {
+      // Id inside the build span.
+      if (!_bitmap_get(_deleted, item) && !_bitmap_get(_shadowed, item)) {
+        set_error_from_string(error,
+            "Item already exists. Use update_item() to replace its vector.");
+        return false;
+      }
+      // Re-adding a deleted id: the old slot stays tombstoned, a fresh node
+      // carrying the same external id is appended and found via linear scan.
+      _append_new_node(item, &w[0]);
+      _bitmap_clear(_explicit_del, item); // explicit tombstone superseded by the new live copy
+      _active_count++;
+      _mutated = true;
+      return true;
+    }
+
+    // Genuinely new external id beyond the build span.
+    _append_new_node(item, &w[0]);
+    _active_count++;
+    _mutated = true;
+    return true;
+  }
+
+  // DotProduct flips `built` on item nodes at postprocess() time so that
+  // post-build queries use raw dot products; newly written nodes need the
+  // same flag. No-op for every other metric.
+  template<typename Node_ = Node>
+  typename std::enable_if<std::is_same<Node_, typename DotProduct::template Node<S, T> >::value>::type
+  _mark_appended_built(Node_* n) { n->built = true; }
+  template<typename Node_ = Node>
+  typename std::enable_if<!std::is_same<Node_, typename DotProduct::template Node<S, T> >::value>::type
+  _mark_appended_built(Node_*) {}
+
+public:
     
   bool on_disk_build(const char* file, char** error=NULL) {
     _on_disk = true;
@@ -1033,7 +1410,212 @@ public:
 #endif
     return true;
   }
-    
+
+  // ---- Dynamic index: public mutation API ------------------------------
+  bool delete_item(S item, bool must_exist, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
+    return _delete_item_locked(item, must_exist, error);
+  }
+
+  bool delete_items(const vector<S>& items, bool must_exist, S* missing, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
+    for (size_t idx = 0; idx < items.size(); idx++) {
+      S item = items[idx];
+      if (!_delete_item_locked(item, must_exist, error)) {
+        if (missing) *missing = item;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Distinct dead external ids: explicitly deleted in-span ids plus deleted
+  // appended-only ids. Legacy holes are not counted (they were never live).
+  S _count_dead_distinct() const {
+    S dead = 0;
+    for (S i = 0; i < _n_items; i++) {
+      if (_bitmap_get(_explicit_del, i)) dead++;
+    }
+    for (S k = 0; k < _n_appended; k++) {
+      if (_bitmap_get(_appended_del, k) && _appended_ids[k] >= _n_items)
+        dead++;
+    }
+    return dead;
+  }
+
+  // Caller must hold _dyn_mutex exclusively.
+  bool _delete_item_locked(S item, bool must_exist, char** error) {
+    if (_read_only) {
+      set_error_from_string(error,
+          "Index was opened with load() (read-only). Reopen with load_mutable() to modify it.");
+      return false;
+    }
+    if (item < 0) {
+      set_error_from_string(error, "Item index can not be negative");
+      return false;
+    }
+    // The live version of an updated/re-added id lives in the append region.
+    for (S k = 0; k < _n_appended; k++) {
+      if (_appended_ids[k] == item && !_bitmap_get(_appended_del, k)) {
+        _bitmap_set(_appended_del, k);
+        _active_count--;
+        if (item < _n_items) {
+          _bitmap_set(_deleted, item);     // runtime view: underlying slot is dead
+          _bitmap_set(_explicit_del, item);
+        }
+        _mutated = true;
+        return true;
+      }
+    }
+    if (item < _n_items) {
+      if (_bitmap_get(_deleted, item)) {
+        if (must_exist) {
+          char buf[128];
+          snprintf(buf, sizeof(buf), "Item %d does not exist or was already deleted", (int)item);
+          set_error_from_string(error, buf);
+          return false;
+        }
+        return true; // idempotent
+      }
+      _bitmap_set(_deleted, item);
+      _bitmap_set(_explicit_del, item);
+      if (!_bitmap_get(_shadowed, item))
+        _active_count--; // shadowed slots were already accounted for when their append copy died
+      _mutated = true;
+      return true;
+    }
+    // Appended-only id whose node is already tombstoned, or an unknown id.
+    bool known = false;
+    for (S k = 0; k < _n_appended; k++)
+      if (_appended_ids[k] == item) known = true;
+    if (known || !must_exist)
+      return true; // already-deleted append is idempotent in non-strict mode
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Item %d does not exist", (int)item);
+    set_error_from_string(error, buf);
+    return false;
+  }
+
+  bool update_item(S item, const T* w, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
+    if (_read_only) {
+      set_error_from_string(error,
+          "Index was opened with load() (read-only). Reopen with load_mutable() to modify it.");
+      return false;
+    }
+    S slot = _resolve_slot(item);
+    if (slot < 0) {
+      set_error_from_string(error,
+          "Item does not exist or has been deleted. Use add_item() to insert a new item.");
+      return false;
+    }
+    if (slot >= _tree_nodes) {
+      // Already living in the append region: overwrite in place, no bookkeeping changes.
+      S k = slot - _tree_nodes;
+      Node* n = _get(slot);
+      D::zero_value(n);
+      n->n_descendants = 1;
+      n->children[0] = 0;
+      n->children[1] = 0;
+      for (int z = 0; z < _f; z++)
+        n->v[z] = w[z];
+      D::init_node(n, _f);
+      _mark_appended_built(n);
+      (void)k;
+      _mutated = true;
+      return true;
+    }
+    // In-span item: mark its old slot shadowed (trees may still route there,
+    // but queries skip shadowed slots) and append the new vector under the
+    // same external id. Active count is unchanged.
+    _bitmap_set(_shadowed, item);
+    _append_new_node(item, w);
+    _mutated = true;
+    return true;
+  }
+
+  S get_n_active_items() const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    return _active_count;
+  }
+
+  S get_n_appended_items() const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    return _n_appended;
+  }
+
+  double get_deleted_fraction() const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    S dead = _count_dead_distinct();
+    S known = _active_count + dead;
+    if (known <= 0) return 0.0;
+    return (double)dead / (double)known;
+  }
+
+  bool item_exists(S item) const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    return _resolve_slot(item) >= 0;
+  }
+
+  // Rebuild a clean index from the live items only. In memory mode the
+  // rebuilt index replaces this one (external ids are preserved verbatim);
+  // on-disk mode it is written atomically to `filename`, which can then be
+  // reopened. Tombstones, holes and appended scan lists are all eliminated.
+  bool compact(const char* filename, int n_trees, int n_jobs, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
+    if (!_built) {
+      set_error_from_string(error, "You can't compact an index that hasn't been built");
+      return false;
+    }
+    if (_read_only) {
+      set_error_from_string(error,
+          "Index was opened with load() (read-only). Reopen with load_mutable() to compact it.");
+      return false;
+    }
+    AnnoyIndex compacted(_f);
+    compacted.set_seed(_seed);
+    compacted.verbose(_verbose);
+    vector<S> live;
+    for (S i = 0; i < _n_items; i++) {
+      if (!_bitmap_get(_deleted, i) && !_bitmap_get(_shadowed, i))
+        live.push_back(i);
+    }
+    for (S k = 0; k < _n_appended; k++) {
+      if (_bitmap_get(_appended_del, k)) continue;
+      S id = _appended_ids[k];
+      if (id < _n_items) continue; // in-span id; appended version handled below via _resolve_slot
+      live.push_back(id);
+    }
+    // Updated/re-added in-span ids now live in the append region; include
+    // them with their newest vector (they were excluded from the first loop).
+    for (S k = 0; k < _n_appended; k++) {
+      if (_bitmap_get(_appended_del, k)) continue;
+      S id = _appended_ids[k];
+      if (id >= _n_items) continue;
+      live.push_back(id);
+    }
+    vector<T> buf(_f);
+    for (size_t li = 0; li < live.size(); li++) {
+      S id = live[li];
+      S slot = _resolve_slot(id);
+      if (slot < 0) continue;
+      memcpy(&buf[0], _get(slot)->v, _f * sizeof(T));
+      if (!compacted.add_item(id, &buf[0], error)) return false;
+    }
+    if (!compacted.build(n_trees, n_jobs, error)) return false;
+    if (filename) {
+      if (!compacted._save_to_file(filename, false, error)) return false;
+      // compacted has reloaded its own file; adopt its in-memory state too
+    } else if (_on_disk) {
+      set_error_from_string(error,
+          "On-disk indexes require a filename for compact()");
+      return false;
+    }
+    // Adopt the compacted state regardless; on-disk callers can reopen the file.
+    _adopt_compacted(compacted);
+    return true;
+  }
+
   bool build(int q, int n_threads=-1, char** error=NULL) {
     if (_loaded) {
       set_error_from_string(error, "You can't build a loaded index");
@@ -1045,6 +1627,7 @@ public:
       return false;
     }
 
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
     D::template preprocess<T, S, Node>(_nodes, _s, _n_items, _f);
 
     _n_nodes = _n_items;
@@ -1073,13 +1656,32 @@ public:
 
     D::template postprocess<T, S, Node>(_nodes, _s, _n_items, _f);
 
+    // Initialize dynamic-index bookkeeping. Legacy holes (slots that were
+    // never add_item'ed) are marked in the runtime-only _deleted view;
+    // _explicit_del stays empty until someone actually calls delete_item.
+    _sync_bitmap_sizes();
+    _tree_nodes = _n_nodes;
+    _active_count = 0;
+    for (S i = 0; i < _n_items; i++) {
+      if (_get(i)->n_descendants != 1)
+        _bitmap_set(_deleted, i);
+      else
+        _active_count++;
+    }
+
     _built = true;
     return true;
   }
   
   bool unbuild(char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
     if (_loaded) {
       set_error_from_string(error, "You can't unbuild a loaded index");
+      return false;
+    }
+    if (_mutated) {
+      set_error_from_string(error,
+          "Can't unbuild after deletes/updates/appends; create a new index instead.");
       return false;
     }
 
@@ -1091,39 +1693,30 @@ public:
   }
 
   bool save(const char* filename, bool prefault=false, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
     if (!_built) {
       set_error_from_string(error, "You can't save an index that hasn't been built");
       return false;
     }
     if (_on_disk) {
-      return true;
-    } else {
-      // Delete file if it already exists (See issue #335)
-#ifndef _MSC_VER
-      unlink(filename);
-#else
-      _unlink(filename);
-#endif
-
-      FILE *f = fopen(filename, "wb");
-      if (f == NULL) {
-        set_error_from_errno(error, "Unable to open");
-        return false;
-      }
-
-      if (fwrite(_nodes, _s, _n_nodes, f) != (size_t) _n_nodes) {
-        set_error_from_errno(error, "Unable to write");
-        return false;
-      }
-
-      if (fclose(f) == EOF) {
-        set_error_from_errno(error, "Unable to close");
-        return false;
-      }
-
-      unload();
-      return load(filename, prefault, error);
+      // Persist the dynamic trailer alongside the already-mmap'd nodes.
+      return _persist_dynamic_trailer(_fd, error);
     }
+    return _save_to_file(filename, prefault, error);
+  }
+
+  // Read-only load: identical performance characteristics to legacy Annoy,
+  // including indexes written by older versions (bare node files).
+  bool load(const char* filename, bool prefault=false, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
+    return _load_impl(filename, prefault, true, error);
+  }
+
+  // Writable load: the same file formats are accepted, but mutations are
+  // allowed and subsequent save() rewrites the file atomically.
+  bool load_mutable(const char* filename, bool prefault=false, char** error=NULL) {
+    UniqueGuardT<DynMutex> guard(_dyn_mutex);
+    return _load_impl(filename, prefault, false, error);
   }
 
   void reinitialize() {
@@ -1136,6 +1729,17 @@ public:
     _on_disk = false;
     _seed = Random::default_seed;
     _roots.clear();
+    _deleted.clear();
+    _explicit_del.clear();
+    _shadowed.clear();
+    _appended_del.clear();
+    _appended_ids.clear();
+    _n_appended = 0;
+    _tree_nodes = 0;
+    _active_count = 0;
+    _read_only = false;
+    _mutated = false;
+    _mmap_size = 0;
   }
 
   void unload() {
@@ -1145,16 +1749,16 @@ public:
 #else
       _close(_fd);
 #endif
-      munmap(_nodes, _s * _nodes_size);
+      munmap(_nodes, _mmap_size ? _mmap_size : (_s * _nodes_size));
     } else {
       if (_fd) {
-        // we have mmapped data
+        // we have mmapped data (may include the dynamic trailer)
 #ifndef _MSC_VER
         close(_fd);
 #else
         _close(_fd);
 #endif
-        munmap(_nodes, _n_nodes * _s);
+        munmap(_nodes, _mmap_size ? _mmap_size : (_n_nodes * _s));
       } else if (_nodes) {
         // We have heap allocated data
         free(_nodes);
@@ -1164,11 +1768,13 @@ public:
     if (_verbose) annoylib_showUpdate("unloaded\n");
   }
 
-  bool load(const char* filename, bool prefault=false, char** error=NULL) {
+  bool _load_impl(const char* filename, bool prefault, bool read_only, char** error) {
 #ifndef _MSC_VER
-    _fd = open(filename, O_RDONLY, (int)0400);
+    int open_flags = read_only ? O_RDONLY : O_RDWR;
+    _fd = open(filename, open_flags, (int)0400);
 #else
-    _fd = _open(filename, _O_RDONLY, (int)0400);
+    int open_flags = read_only ? _O_RDONLY : _O_RDWR;
+    _fd = _open(filename, open_flags, (int)0400);
 #endif
     if (_fd == -1) {
       set_error_from_errno(error, "Unable to open");
@@ -1180,14 +1786,88 @@ public:
       set_error_from_errno(error, "Unable to get size");
       return false;
     } else if (size == 0) {
-      set_error_from_errno(error, "Size of file is zero");
-      return false;
-    } else if (size % _s) {
-      // Something is fishy with this index!
-      set_error_from_errno(error, "Index size is not a multiple of vector size. Ensure you are opening using the same metric you used to create the index.");
+      set_error_from_string(error, "Size of file is zero");
       return false;
     }
 
+    const size_t magic_len = sizeof(ANNOY_DYNAMIC_MAGIC);
+    bool is_dynamic = (size_t)size >= magic_len;
+    if (is_dynamic) {
+      uint8_t tail[8];
+      if (lseek(_fd, size - (off_t)magic_len, SEEK_SET) == -1 ||
+          read(_fd, tail, magic_len) != (ssize_t)magic_len ||
+          memcmp(tail, ANNOY_DYNAMIC_MAGIC, magic_len) != 0) {
+        is_dynamic = false;
+      }
+    }
+
+    size_t node_bytes;
+    AnnoyIndexFooter footer;
+    memset(&footer, 0, sizeof(footer));
+    if (is_dynamic) {
+      if ((size_t)size < magic_len + sizeof(AnnoyIndexFooter)) {
+        set_error_from_string(error, "Truncated dynamic index file");
+        return false;
+      }
+      if (lseek(_fd, size - (off_t)magic_len - (off_t)sizeof(AnnoyIndexFooter), SEEK_SET) == -1) {
+        set_error_from_errno(error, "Unable to seek");
+        return false;
+      }
+      if (read(_fd, &footer, sizeof(footer)) != (ssize_t)sizeof(footer)) {
+        set_error_from_errno(error, "Unable to read index metadata");
+        return false;
+      }
+      if (footer.magic_cookie != 0x414e4e31u) {
+        set_error_from_string(error, "Corrupt index metadata");
+        return false;
+      }
+      uint32_t stored_crc = footer.crc32;
+      footer.crc32 = 0;
+      uint32_t actual_crc = annoy_crc32(reinterpret_cast<const uint8_t*>(&footer), sizeof(footer));
+      if (stored_crc != actual_crc) {
+        set_error_from_string(error,
+            "Index metadata checksum mismatch; the file was not fully written or is corrupt");
+        return false;
+      }
+      if (footer.format_version != ANNOY_DYNAMIC_FORMAT_VERSION) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "Unsupported index format version %u (this build supports version %u)",
+                 footer.format_version, ANNOY_DYNAMIC_FORMAT_VERSION);
+        set_error_from_string(error, buf);
+        return false;
+      }
+      if ((int)footer.dimensions != _f) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "Dimension mismatch: index has %u dimensions but was opened with %d",
+                 footer.dimensions, _f);
+        set_error_from_string(error, buf);
+        return false;
+      }
+      if (footer.metric_tag != annoy_metric_tag(D::name())) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "Metric mismatch: index was built with metric tag %u but was opened as '%s'",
+                 footer.metric_tag, D::name());
+        set_error_from_string(error, buf);
+        return false;
+      }
+      node_bytes = (size_t)footer.node_count * _s;
+      if ((size_t)size != node_bytes + (size_t)footer.trailer_bytes) {
+        set_error_from_string(error, "Index file size does not match its metadata");
+        return false;
+      }
+    } else {
+      if (size % _s) {
+        set_error_from_string(error,
+            "Index size is not a multiple of vector size. Ensure you are opening using the same metric you used to create the index.");
+        return false;
+      }
+      node_bytes = (size_t)size;
+    }
+
+    int mmap_prot = read_only ? PROT_READ : (PROT_READ | PROT_WRITE);
     int flags = MAP_SHARED;
     if (prefault) {
 #ifdef MAP_POPULATE
@@ -1196,10 +1876,16 @@ public:
       annoylib_showUpdate("prefault is set to true, but MAP_POPULATE is not defined on this platform");
 #endif
     }
-    _nodes = (Node*)mmap(0, size, PROT_READ, flags, _fd, 0);
-    _n_nodes = (S)(size / _s);
+    _mmap_size = (size_t)size;
+    _nodes = (Node*)mmap(0, _mmap_size, mmap_prot, flags, _fd, 0);
+    if (_nodes == MAP_FAILED) {
+      set_error_from_errno(error, "Unable to map index file");
+      _nodes = NULL;
+      return false;
+    }
+    _n_nodes = (S)(node_bytes / _s);
 
-    // Find the roots by scanning the end of the file and taking the nodes with most descendants
+    // Find the roots by scanning the end of the node region and taking the nodes with most descendants
     _roots.clear();
     S m = -1;
     for (S i = _n_nodes - 1; i >= 0; i--) {
@@ -1216,30 +1902,318 @@ public:
       _roots.pop_back();
     _loaded = true;
     _built = true;
+    _read_only = read_only;
+    _on_disk = false;
+    _nodes_size = _n_nodes;
     _n_items = m;
+
+    if (is_dynamic) {
+      size_t payload_bytes = (size_t)footer.trailer_bytes
+          - sizeof(AnnoyIndexFooter) - magic_len;
+      const uint8_t* bm_ptr = (uint8_t*)_nodes + node_bytes;
+      size_t off = 0;
+      size_t consumed = 0;
+      if (!annoy_sparse_read(bm_ptr + off, payload_bytes - off, (size_t)footer.n_items,
+                             &_explicit_del, &consumed, error)) return false;
+      off += consumed;
+      if (!annoy_sparse_read(bm_ptr + off, payload_bytes - off, (size_t)footer.n_items,
+                             &_shadowed, &consumed, error)) return false;
+      off += consumed;
+      if (!annoy_sparse_read(bm_ptr + off, payload_bytes - off, (size_t)footer.n_appended,
+                             &_appended_del, &consumed, error)) return false;
+      off += consumed;
+      size_t ids_bytes = (size_t)footer.n_appended * sizeof(S);
+      if (off + ids_bytes > payload_bytes) {
+        set_error_from_string(error, "Truncated appended-id table in index");
+        return false;
+      }
+      _appended_ids.resize((size_t)footer.n_appended);
+      if (ids_bytes)
+        memcpy(&_appended_ids[0], bm_ptr + off, ids_bytes);
+      off += ids_bytes;
+      if (off != payload_bytes) {
+        set_error_from_string(error, "Trailing garbage in index trailer");
+        return false;
+      }
+
+      _n_appended = footer.n_appended;
+      _tree_nodes = (S)footer.tree_node_count;
+      _n_items = (S)footer.n_items;
+      _sync_bitmap_sizes();
+      // Runtime dead view starts from legacy holes (zeroed slots)...
+      _active_count = 0;
+      for (S i = 0; i < _n_items; i++) {
+        if (_get(i)->n_descendants != 1)
+          _bitmap_set(_deleted, i);
+      }
+      // ...then overlay explicit tombstones.
+      for (S i = 0; i < _n_items; i++) {
+        if (_bitmap_get(_explicit_del, i))
+          _bitmap_set(_deleted, i);
+      }
+      // A live append-region copy supersedes any in-span tombstone/shadow.
+      for (S k = 0; k < _n_appended; k++) {
+        if (_bitmap_get(_appended_del, k)) continue;
+        S id = _appended_ids[k];
+        if (id < _n_items) {
+          _bitmap_clear(_deleted, id);
+          _bitmap_clear(_explicit_del, id);
+          _bitmap_set(_shadowed, id); // old slot hidden, new copy is authoritative
+        }
+      }
+      // Active in-span items that still live in their original slots:
+      // neither dead (hole/tombstone) nor shadowed by an append-region copy.
+      for (S i = 0; i < _n_items; i++) {
+        if (!_bitmap_get(_deleted, i) && !_bitmap_get(_shadowed, i))
+          _active_count++;
+      }
+      // Every live append-region node represents one live external id:
+      //  - ids beyond the span are genuinely new items;
+      //  - in-span ids are updated/re-added items whose original slot is
+      //    shadowed and therefore was excluded from the loop above.
+      for (S k = 0; k < _n_appended; k++) {
+        if (!_bitmap_get(_appended_del, k))
+          _active_count++;
+      }
+    } else {
+      // Legacy file: derive tombstones from zeroed (never-written) slots.
+      _sync_bitmap_sizes();
+      _tree_nodes = _n_nodes;
+      _active_count = 0;
+      for (S i = 0; i < _n_items; i++) {
+        if (_get(i)->n_descendants != 1)
+          _bitmap_set(_deleted, i);
+        else
+          _active_count++;
+      }
+      _n_appended = 0;
+    }
+    _mutated = false;
     if (_verbose) annoylib_showUpdate("found %zu roots with degree %d\n", _roots.size(), m);
     return true;
   }
 
+  // ---- Persistence helpers ---------------------------------------------
+  // Build the sparse trailer payload (everything except nodes, footer, magic).
+  vector<uint8_t> _build_trailer_payload() const {
+    vector<uint8_t> payload;
+    annoy_sparse_write(&payload, _explicit_del, (size_t)_n_items);
+    annoy_sparse_write(&payload, _shadowed, (size_t)_n_items);
+    annoy_sparse_write(&payload, _appended_del, (size_t)_n_appended);
+    if (_n_appended > 0) {
+      const uint8_t* p = (const uint8_t*)&_appended_ids[0];
+      payload.insert(payload.end(), p, p + _n_appended * sizeof(S));
+    }
+    return payload;
+  }
+
+  AnnoyIndexFooter _make_footer(size_t payload_bytes) const {
+    AnnoyIndexFooter footer;
+    memset(&footer, 0, sizeof(footer));
+    footer.magic_cookie = 0x414e4e31u;
+    footer.format_version = ANNOY_DYNAMIC_FORMAT_VERSION;
+    footer.dimensions = (uint32_t)_f;
+    footer.metric_tag = annoy_metric_tag(D::name());
+    footer.node_count = (int64_t)_n_nodes;
+    footer.tree_node_count = (int64_t)_tree_nodes;
+    footer.n_items = (int64_t)_n_items;
+    footer.n_appended = (int64_t)_n_appended;
+    footer.trailer_bytes = (int64_t)(payload_bytes
+        + sizeof(AnnoyIndexFooter) + sizeof(ANNOY_DYNAMIC_MAGIC));
+    footer.reserved = 0;
+    footer.crc32 = 0;
+    footer.crc32 = annoy_crc32(reinterpret_cast<const uint8_t*>(&footer), sizeof(footer));
+    return footer;
+  }
+
+  bool _save_to_file(const char* filename, bool prefault, char** error) {
+    // Atomic write: temp file in the same directory, fsync, rename. A crash
+    // leaves either the previous file or the complete new one.
+    std::string tmp = std::string(filename) + ".tmp-annoy";
+#ifndef _MSC_VER
+    unlink(tmp.c_str());
+#else
+    _unlink(tmp.c_str());
+#endif
+    int fd = open(tmp.c_str(), O_RDWR | O_CREAT | O_EXCL, (int)0644);
+    if (fd == -1) {
+      set_error_from_errno(error, "Unable to open");
+      return false;
+    }
+    bool ok = _write_full(fd, (const uint8_t*)_nodes, (size_t)_n_nodes * _s, error);
+    if (ok) ok = _write_trailer(fd, error);
+    if (ok && fsync(fd) == -1) {
+      set_error_from_errno(error, "Unable to sync");
+      ok = false;
+    }
+    if (close(fd) == -1 && ok) {
+      set_error_from_errno(error, "Unable to close");
+      ok = false;
+    }
+    if (!ok) {
+#ifndef _MSC_VER
+      unlink(tmp.c_str());
+#else
+      _unlink(tmp.c_str());
+#endif
+      return false;
+    }
+#ifndef _MSC_VER
+    if (rename(tmp.c_str(), filename) == -1) {
+      set_error_from_errno(error, "Unable to rename");
+      unlink(tmp.c_str());
+      return false;
+    }
+#else
+    if (_rename(tmp.c_str(), filename) == -1) {
+      set_error_from_errno(error, "Unable to rename");
+      _unlink(tmp.c_str());
+      return false;
+    }
+#endif
+    // Re-open the just-written file, mirroring legacy save() behavior.
+    unload();
+    return _load_impl(filename, prefault, false, error);
+  }
+
+  bool _write_full(int fd, const uint8_t* buf, size_t len, char** error) {
+    size_t off = 0;
+    while (off < len) {
+      ssize_t w = buf ? write(fd, buf + off, len - off) : write(fd, "", 0);
+      if (w < 0) {
+        if (errno == EINTR) continue;
+        set_error_from_errno(error, "Unable to write");
+        return false;
+      }
+      off += (size_t)w;
+    }
+    return true;
+  }
+
+  // Writes sparse sections, appended ids, footer and magic.
+  bool _write_trailer(int fd, char** error) {
+    vector<uint8_t> payload = _build_trailer_payload();
+    if (!_write_full(fd, payload.empty() ? NULL : &payload[0], payload.size(), error))
+      return false;
+    AnnoyIndexFooter footer = _make_footer(payload.size());
+    if (!_write_full(fd, (const uint8_t*)&footer, sizeof(footer), error)) return false;
+    return _write_full(fd, (const uint8_t*)ANNOY_DYNAMIC_MAGIC,
+                       sizeof(ANNOY_DYNAMIC_MAGIC), error);
+  }
+
+  // On-disk mode: nodes already live in the mmap. Write a sibling temp file
+  // with the full content and atomically rename it over the original.
+  bool _persist_dynamic_trailer(int fd, char** error) {
+    char linkpath[64];
+    snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
+    char target[4096];
+    ssize_t n = readlink(linkpath, target, sizeof(target) - 1);
+    if (n <= 0) {
+      set_error_from_errno(error, "Unable to resolve on-disk index path");
+      return false;
+    }
+    target[n] = 0;
+    if (msync(_nodes, _s * (size_t)_nodes_size, MS_SYNC) == -1) {
+      set_error_from_errno(error, "Unable to sync index nodes");
+      return false;
+    }
+    std::string tmp = std::string(target) + ".tmp-annoy";
+    int out = open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, (int)0644);
+    if (out == -1) {
+      set_error_from_errno(error, "Unable to open");
+      return false;
+    }
+    bool ok = _write_full(out, (const uint8_t*)_nodes, (size_t)_n_nodes * _s, error);
+    if (ok) ok = _write_trailer(out, error);
+    if (ok && fsync(out) == -1) {
+      set_error_from_errno(error, "Unable to sync");
+      ok = false;
+    }
+    if (close(out) == -1 && ok) {
+      set_error_from_errno(error, "Unable to close");
+      ok = false;
+    }
+    if (!ok) {
+      unlink(tmp.c_str());
+      return false;
+    }
+    if (rename(tmp.c_str(), target) == -1) {
+      set_error_from_errno(error, "Unable to rename");
+      unlink(tmp.c_str());
+      return false;
+    }
+    return true;
+  }
+
+  void _adopt_compacted(const AnnoyIndex& other) {
+    bool donor_mapped = (other._fd != 0);
+    if (_fd) {
+      close(_fd);
+      munmap(_nodes, _mmap_size ? _mmap_size : (_n_nodes * _s));
+      _fd = 0;
+    } else if (_nodes) {
+      free(_nodes);
+    }
+    _nodes = other._nodes;
+    _nodes_size = other._nodes_size;
+    _n_nodes = other._n_nodes;
+    _n_items = other._n_items;
+    _roots = other._roots;
+    _deleted = other._deleted;
+    _explicit_del = other._explicit_del;
+    _shadowed = other._shadowed;
+    _appended_del = other._appended_del;
+    _appended_ids = other._appended_ids;
+    _n_appended = other._n_appended;
+    _tree_nodes = other._tree_nodes;
+    _active_count = other._active_count;
+    _on_disk = false;
+    _mmap_size = donor_mapped ? other._mmap_size : 0;
+    if (donor_mapped) {
+      // Take ownership of the donor's mmap and file descriptor.
+      _loaded = true;
+      _read_only = false;
+      _fd = other._fd;
+      const_cast<AnnoyIndex&>(other)._fd = 0;
+      const_cast<AnnoyIndex&>(other)._nodes = NULL;
+    } else {
+      _loaded = false;
+      _read_only = false;
+      const_cast<AnnoyIndex&>(other)._nodes = NULL;
+    }
+    _mutated = false;
+  }
+
   T get_distance(S i, S j) const {
-    return D::normalized_distance(D::distance(_get(i), _get(j), _f));
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    S si = _resolve_slot(i);
+    S sj = _resolve_slot(j);
+    if (si < 0 || sj < 0)
+      return numeric_limits<T>::quiet_NaN();
+    return D::normalized_distance(D::distance(_get(si), _get(sj), _f));
   }
 
   void get_nns_by_item(S item, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
-    // TODO: handle OOB
-    const Node* m = _get(item);
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    S slot = _resolve_slot(item);
+    if (slot < 0)
+      return; // deleted or unknown: empty result, no phantom ids
+    const Node* m = _get(slot);
     _get_all_nns(m->v, n, search_k, result, distances);
   }
 
   void get_nns_by_vector(const T* w, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
     _get_all_nns(w, n, search_k, result, distances);
   }
 
   S get_n_items() const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
     return _n_items;
   }
 
   S get_n_trees() const {
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
     return (S)_roots.size();
   }
 
@@ -1248,8 +2222,13 @@ public:
   }
 
   void get_item(S item, T* v) const {
-    // TODO: handle OOB
-    Node* m = _get(item);
+    SharedGuardT<DynMutex> guard(_dyn_mutex);
+    S slot = _resolve_slot(item);
+    if (slot < 0) {
+      memset(v, 0, _f * sizeof(T));
+      return;
+    }
+    Node* m = _get(slot);
     memcpy(v, m->v, (_f) * sizeof(T));
   }
 
@@ -1296,22 +2275,48 @@ public:
   }
 
 protected:
+  // A mmap'd index (load_mutable) cannot be realloc'ed, so the first
+  // post-load append copies the node region into a heap buffer. The file is
+  // only rewritten again on an explicit save().
+  bool _detach_mmap_if_needed() {
+    if (!_loaded || _on_disk)
+      return false;
+    size_t bytes = (size_t)_n_nodes * _s;
+    void* heap = malloc(bytes);
+    if (!heap)
+      return false;
+    memcpy(heap, _nodes, bytes);
+    munmap(_nodes, _mmap_size);
+    if (_fd) {
+      close(_fd);
+      _fd = 0;
+    }
+    _nodes = heap;
+    _loaded = false;
+    _mmap_size = 0;
+    // Grow room for appends gets allocated lazily by _reallocate_nodes.
+    _nodes_size = _n_nodes;
+    return true;
+  }
+
   void _reallocate_nodes(S n) {
     const double reallocation_factor = 1.3;
     S new_nodes_size = std::max(n, (S) ((_nodes_size + 1) * reallocation_factor));
     void *old = _nodes;
-    
+
     if (_on_disk) {
-      if (!remap_memory_and_truncate(&_nodes, _fd, 
-          static_cast<size_t>(_s) * static_cast<size_t>(_nodes_size), 
-          static_cast<size_t>(_s) * static_cast<size_t>(new_nodes_size)) && 
+      if (!remap_memory_and_truncate(&_nodes, _fd,
+          static_cast<size_t>(_s) * static_cast<size_t>(_nodes_size),
+          static_cast<size_t>(_s) * static_cast<size_t>(new_nodes_size)) &&
           _verbose)
           annoylib_showUpdate("File truncation error\n");
     } else {
+      if (_loaded)
+        _detach_mmap_if_needed();
       _nodes = realloc(_nodes, _s * new_nodes_size);
       memset((char *) _nodes + (_nodes_size * _s) / sizeof(char), 0, (new_nodes_size - _nodes_size) * _s);
     }
-    
+
     _nodes_size = new_nodes_size;
     if (_verbose) annoylib_showUpdate("Reallocating to %d nodes: old_address=%p, new_address=%p\n", new_nodes_size, old, _nodes);
   }
@@ -1444,7 +2449,31 @@ protected:
     return item;
   }
 
+  // True when the node slot is a live item (tombstone/shadow aware).
+  bool _slot_is_live(S slot) const {
+    if (slot < _n_items)
+      return !_bitmap_get(_deleted, slot) && !_bitmap_get(_shadowed, slot);
+    S k = slot - _tree_nodes;
+    if (k >= 0 && k < _n_appended)
+      return !_bitmap_get(_appended_del, k);
+    return false;
+  }
+
+  // Map a node slot back to its stable external id.
+  S _external_id(S slot) const {
+    if (slot < _n_items)
+      return slot;
+    S k = slot - _tree_nodes;
+    if (k >= 0 && k < _n_appended)
+      return _appended_ids[k];
+    return slot;
+  }
+
   void _get_all_nns(const T* v, size_t n, int search_k, vector<S>* result, vector<T>* distances) const {
+    if (!_built) {
+      // Matches legacy Annoy: queries before build() have no trees to walk.
+      return;
+    }
     Node* v_node = (Node *)alloca(_s);
     D::template zero_value<Node>(v_node);
     memcpy(v_node->v, v, sizeof(T) * _f);
@@ -1468,15 +2497,27 @@ protected:
       Node* nd = _get(i);
       q.pop();
       if (nd->n_descendants == 1 && i < _n_items) {
-        nns.push_back(i);
+        if (_slot_is_live(i))
+          nns.push_back(i);
       } else if (nd->n_descendants <= _K) {
         const S* dst = nd->children;
-        nns.insert(nns.end(), dst, &dst[nd->n_descendants]);
+        for (S c = 0; c < nd->n_descendants; c++) {
+          if (_slot_is_live(dst[c]))
+            nns.push_back(dst[c]);
+        }
       } else {
         T margin = D::margin(nd, v, _f);
         q.push(make_pair(D::pq_distance(d, margin, 1), static_cast<S>(nd->children[1])));
         q.push(make_pair(D::pq_distance(d, margin, 0), static_cast<S>(nd->children[0])));
       }
+    }
+
+    // Post-build additions and reactivated/updated slots are not part of any
+    // tree, so scan them explicitly. Cost is O(n_appended * f) per query.
+    for (S k = 0; k < _n_appended; k++) {
+      S slot = _tree_nodes + k;
+      if (_get(slot)->n_descendants == 1 && _slot_is_live(slot))
+        nns.push_back(slot);
     }
 
     // Get distances for all items
@@ -1485,16 +2526,19 @@ protected:
     vector<pair<T, S> > nns_dist;
     S last = -1;
     for (size_t i = 0; i < nns.size(); i++) {
-      S j = nns[i]; 
+      S j = nns[i];
       if (j == last)
         continue;
       last = j;
+      if (!_slot_is_live(j))
+        continue; // belt and braces: never surface a tombstoned item
       if (_get(j)->n_descendants == 1)  // This is only to guard a really obscure case, #284
-        nns_dist.push_back(make_pair(D::distance(v_node, _get(j), _f), j));
+        nns_dist.push_back(make_pair(D::distance(v_node, _get(j), _f), _external_id(j)));
     }
 
     size_t m = nns_dist.size();
-    size_t p = n < m ? n : m; // Return this many items
+    size_t p = n < m ? n : m; // Return this many items; fewer than n means the
+                              // index simply does not hold n live candidates
     std::partial_sort(nns_dist.begin(), nns_dist.begin() + p, nns_dist.end());
     for (size_t i = 0; i < p; i++) {
       if (distances)

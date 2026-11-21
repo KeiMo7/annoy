@@ -127,6 +127,27 @@ public:
   };
   void set_seed(uint64_t q) { _index.set_seed(q); };
   bool on_disk_build(const char* filename, char** error) { return _index.on_disk_build(filename, error); };
+  bool delete_item(int32_t item, bool must_exist, char** error) {
+    return _index.delete_item(item, must_exist, error);
+  };
+  bool delete_items(const vector<int32_t>& items, bool must_exist, int32_t* missing, char** error) {
+    return _index.delete_items(items, must_exist, missing, error);
+  };
+  bool update_item(int32_t item, const float* w, char** error) {
+    vector<uint64_t> w_internal(_f_internal, 0);
+    _pack(w, &w_internal[0]);
+    return _index.update_item(item, &w_internal[0], error);
+  };
+  bool load_mutable(const char* filename, bool prefault, char** error) {
+    return _index.load_mutable(filename, prefault, error);
+  };
+  int32_t get_n_active_items() const { return _index.get_n_active_items(); };
+  int32_t get_n_appended_items() const { return _index.get_n_appended_items(); };
+  double get_deleted_fraction() const { return _index.get_deleted_fraction(); };
+  bool item_exists(int32_t item) const { return _index.item_exists(item); };
+  bool compact(const char* filename, int n_trees, int n_jobs, char** error) {
+    return _index.compact(filename, n_trees, n_jobs, error);
+  };
 };
 
 // annoy python object
@@ -288,6 +309,9 @@ bool check_constraints(py_annoy *self, int32_t item, bool building) {
     PyErr_SetString(PyExc_IndexError, "Item index can not be negative");
     return false;
   } else if (!building && item >= self->ptr->get_n_items()) {
+    // Ids past the build span may exist as post-build appends.
+    if (self->ptr->item_exists(item))
+      return true;
     PyErr_SetString(PyExc_IndexError, "Item index larger than the largest item index");
     return false;
   } else {
@@ -457,6 +481,169 @@ py_an_on_disk_build(py_annoy *self, PyObject *args, PyObject *kwargs) {
   Py_RETURN_TRUE;
 }
 
+
+static PyObject *
+py_an_delete_item(py_annoy *self, PyObject *args, PyObject *kwargs) {
+  int32_t item;
+  int must_exist = 0;
+  char* error = NULL;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"i", "must_exist", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "i|p", (char**)kwlist, &item, &must_exist))
+    return NULL;
+  if (!self->ptr->delete_item(item, (bool)must_exist, &error)) {
+    PyErr_SetString(PyExc_KeyError, error ? error : "delete failed");
+    free(error);
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
+
+static PyObject *
+py_an_delete_items(py_annoy *self, PyObject *args, PyObject *kwargs) {
+  PyObject* ids;
+  int must_exist = 0;
+  char* error = NULL;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"items", "must_exist", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|p", (char**)kwlist, &ids, &must_exist))
+    return NULL;
+  PyObject* seq = PySequence_Fast(ids, "items must be a sequence of integers");
+  if (!seq)
+    return NULL;
+  Py_ssize_t len = PySequence_Fast_GET_SIZE(seq);
+  vector<int32_t> items;
+  items.reserve((size_t)len);
+  for (Py_ssize_t k = 0; k < len; k++) {
+    PyObject* elem = PySequence_Fast_GET_ITEM(seq, k);
+    long v = PyLong_AsLong(elem);
+    if (v == -1 && PyErr_Occurred()) {
+      Py_DECREF(seq);
+      return NULL;
+    }
+    items.push_back((int32_t)v);
+  }
+  Py_DECREF(seq);
+  int32_t missing = -1;
+  if (!self->ptr->delete_items(items, (bool)must_exist, &missing, &error)) {
+    if (error) {
+      PyErr_SetString(PyExc_KeyError, error);
+      free(error);
+    } else {
+      PyErr_Format(PyExc_KeyError, "Item %d does not exist", missing);
+    }
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
+
+static PyObject *
+py_an_update_item(py_annoy *self, PyObject *args, PyObject *kwargs) {
+  PyObject* v;
+  int32_t item;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"i", "vector", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "iO", (char**)kwlist, &item, &v))
+    return NULL;
+  vector<float> w(self->f);
+  if (!convert_list_to_vector(v, self->f, &w))
+    return NULL;
+  char* error = NULL;
+  if (!self->ptr->update_item(item, &w[0], &error)) {
+    PyErr_SetString(PyExc_KeyError, error ? error : "update failed");
+    free(error);
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
+
+static PyObject *
+py_an_load_mutable(py_annoy *self, PyObject *args, PyObject *kwargs) {
+  char *filename, *error;
+  bool prefault = false;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"fn", "prefault", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s|b", (char**)kwlist, &filename, &prefault))
+    return NULL;
+  if (!self->ptr->load_mutable(filename, prefault, &error)) {
+    PyErr_SetString(PyExc_IOError, error);
+    free(error);
+    return NULL;
+  }
+  Py_RETURN_TRUE;
+}
+
+
+static PyObject *
+py_an_get_n_active_items(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+  return PyInt_FromLong(self->ptr->get_n_active_items());
+}
+
+
+static PyObject *
+py_an_get_n_appended_items(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+  return PyInt_FromLong(self->ptr->get_n_appended_items());
+}
+
+
+static PyObject *
+py_an_get_deleted_fraction(py_annoy *self) {
+  if (!self->ptr)
+    return NULL;
+  return PyFloat_FromDouble(self->ptr->get_deleted_fraction());
+}
+
+
+static PyObject *
+py_an_item_exists(py_annoy *self, PyObject *args) {
+  int32_t item;
+  if (!self->ptr)
+    return NULL;
+  if (!PyArg_ParseTuple(args, "i", &item))
+    return NULL;
+  if (self->ptr->item_exists(item))
+    Py_RETURN_TRUE;
+  Py_RETURN_FALSE;
+}
+
+
+static PyObject *
+py_an_compact(py_annoy *self, PyObject *args, PyObject *kwargs) {
+  char* filename = NULL;
+  int n_trees = -1;
+  int n_jobs = -1;
+  char* error = NULL;
+  if (!self->ptr)
+    return NULL;
+  static char const * kwlist[] = {"fn", "n_trees", "n_jobs", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|sii", (char**)kwlist,
+                                   &filename, &n_trees, &n_jobs))
+    return NULL;
+  if (n_trees < 0)
+    n_trees = (int)self->ptr->get_n_trees();
+  bool res;
+  Py_BEGIN_ALLOW_THREADS;
+  res = self->ptr->compact(filename, n_trees, n_jobs, &error);
+  Py_END_ALLOW_THREADS;
+  if (!res) {
+    PyErr_SetString(PyExc_IOError, error ? error : "compact failed");
+    free(error);
+    return NULL;
+  }
+  Py_RETURN_TRUE;
+}
+
 static PyObject *
 py_an_build(py_annoy *self, PyObject *args, PyObject *kwargs) {
   int q;
@@ -579,7 +766,26 @@ static PyMethodDef AnnoyMethods[] = {
   {"get_nns_by_vector",(PyCFunction)py_an_get_nns_by_vector, METH_VARARGS | METH_KEYWORDS, "Returns the `n` closest items to vector `vector`.\n\n:param search_k: the query will inspect up to `search_k` nodes.\n`search_k` gives you a run-time tradeoff between better accuracy and speed.\n`search_k` defaults to `n_trees * n` if not provided.\n\n:param include_distances: If `True`, this function will return a\n2 element tuple of lists. The first list contains the `n` closest items.\nThe second list contains the corresponding distances."},
   {"get_item_vector",(PyCFunction)py_an_get_item_vector, METH_VARARGS, "Returns the vector for item `i` that was previously added."},
   {"add_item",(PyCFunction)py_an_add_item, METH_VARARGS | METH_KEYWORDS, "Adds item `i` (any nonnegative integer) with vector `v`.\n\nNote that it will allocate memory for `max(i)+1` items."},
-  {"on_disk_build",(PyCFunction)py_an_on_disk_build, METH_VARARGS | METH_KEYWORDS, "Build will be performed with storage on disk instead of RAM."},
+  {"on_disk_build",(PyCFunction)py_an_on_disk_build, METH_VARARGS | METH_KEYWORDS, "Perform build with storage on disk instead of RAM."},
+  {"delete_item", (PyCFunction)py_an_delete_item, METH_VARARGS | METH_KEYWORDS,
+      "Tombstone item `i` without rebuilding the trees. Its external id is never reused by other items.\n\n"
+      ":param must_exist: if True, raise KeyError for unknown/already-deleted ids; if False (default), the call is idempotent."},
+  {"delete_items", (PyCFunction)py_an_delete_items, METH_VARARGS | METH_KEYWORDS,
+      "Tombstone every id in `items` in one locked batch."},
+  {"update_item", (PyCFunction)py_an_update_item, METH_VARARGS | METH_KEYWORDS,
+      "Replace the vector of an existing live item `i` in place. The id and all other items are unchanged."},
+  {"load_mutable", (PyCFunction)py_an_load_mutable, METH_VARARGS | METH_KEYWORDS,
+      "Load an index for read/write. Accepts both legacy and dynamic index files. A subsequent save() rewrites the file atomically."},
+  {"get_n_active_items", (PyCFunction)py_an_get_n_active_items, METH_NOARGS,
+      "Number of live (non-deleted) items currently queryable."},
+  {"get_n_appended_items", (PyCFunction)py_an_get_n_appended_items, METH_NOARGS,
+      "Number of items appended after the last full build/compact."},
+  {"get_deleted_fraction", (PyCFunction)py_an_get_deleted_fraction, METH_NOARGS,
+      "Fraction of known item ids currently tombstoned (0.0 - 1.0)."},
+  {"item_exists", (PyCFunction)py_an_item_exists, METH_VARARGS,
+      "Return True if item `i` is a live, queryable id."},
+  {"compact", (PyCFunction)py_an_compact, METH_VARARGS | METH_KEYWORDS,
+      "Rebuild a clean index from live items only, eliminating tombstones and scan overhead."},
   {"build",(PyCFunction)py_an_build, METH_VARARGS | METH_KEYWORDS, "Builds a forest of `n_trees` trees.\n\nMore trees give higher precision when querying. After calling `build`,\nno more items can be added. `n_jobs` specifies the number of threads used to build the trees. `n_jobs=-1` uses all available CPU cores."},
   {"unbuild",(PyCFunction)py_an_unbuild, METH_NOARGS, "Unbuilds the tree in order to allows adding new items.\n\nbuild() has to be called again afterwards in order to\nrun queries."},
   {"unload",(PyCFunction)py_an_unload, METH_NOARGS, "Unloads an index from disk."},
