@@ -14,3 +14,16 @@
 
 # This module is a dummy wrapper around the underlying C++ module.
 from .annoylib import Annoy as AnnoyIndex
+
+# Optional multi-tenant index manager. Purely additive: importing it here
+# does not change AnnoyIndex behaviour in any way, and callers that do not
+# use it are unaffected (the capability is effectively "off" for them).
+from .tenancy import (
+    TenantIndexManager,
+    TenantError,
+    UnknownTenantError,
+    TenantBudgetError,
+    TenantMountError,
+    TenantBusyError,
+    estimate_resident_bytes,
+)

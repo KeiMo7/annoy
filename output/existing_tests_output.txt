@@ -1,0 +1,315 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.18, pytest-9.2.0, pluggy-1.7.0 -- /tmp/uid80-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/wll/uid80
+collecting ... collected 129 items
+
+test/accuracy_test.py::test_glove_25 FAILED                              [  0%]
+test/accuracy_test.py::test_nytimes_16 FAILED                            [  1%]
+test/accuracy_test.py::test_lastfm_dot FAILED                            [  2%]
+test/accuracy_test.py::test_lastfm_angular FAILED                        [  3%]
+test/angular_index_test.py::test_get_nns_by_vector PASSED                [  3%]
+test/angular_index_test.py::test_get_nns_by_item PASSED                  [  4%]
+test/angular_index_test.py::test_dist PASSED                             [  5%]
+test/angular_index_test.py::test_dist_2 PASSED                           [  6%]
+test/angular_index_test.py::test_dist_3 PASSED                           [  6%]
+test/angular_index_test.py::test_dist_degen PASSED                       [  7%]
+test/angular_index_test.py::test_large_index PASSED                      [  8%]
+test/angular_index_test.py::test_precision_1 PASSED                      [  9%]
+test/angular_index_test.py::test_precision_10 PASSED                     [ 10%]
+test/angular_index_test.py::test_precision_100 PASSED                    [ 10%]
+test/angular_index_test.py::test_precision_1000 PASSED                   [ 11%]
+test/angular_index_test.py::test_load_save_get_item_vector PASSED        [ 12%]
+test/angular_index_test.py::test_get_nns_search_k PASSED                 [ 13%]
+test/angular_index_test.py::test_include_dists PASSED                    [ 13%]
+test/angular_index_test.py::test_include_dists_check_ranges PASSED       [ 14%]
+test/angular_index_test.py::test_distance_consistency PASSED             [ 15%]
+test/angular_index_test.py::test_only_one_item PASSED                    [ 16%]
+test/angular_index_test.py::test_no_items PASSED                         [ 17%]
+test/angular_index_test.py::test_single_vector PASSED                    [ 17%]
+test/dot_index_test.py::test_get_nns_by_vector PASSED                    [ 18%]
+test/dot_index_test.py::test_get_nns_by_item PASSED                      [ 19%]
+test/dot_index_test.py::test_dist PASSED                                 [ 20%]
+test/dot_index_test.py::test_recall_at_10 PASSED                         [ 20%]
+test/dot_index_test.py::test_recall_at_100 PASSED                        [ 21%]
+test/dot_index_test.py::test_recall_at_1000 PASSED                       [ 22%]
+test/dot_index_test.py::test_recall_at_1000_fewer_trees PASSED           [ 23%]
+test/dot_index_test.py::test_get_nns_with_distances PASSED               [ 24%]
+test/dot_index_test.py::test_include_dists PASSED                        [ 24%]
+test/dot_index_test.py::test_distance_consistency PASSED                 [ 25%]
+test/euclidean_index_test.py::test_get_nns_by_vector PASSED              [ 26%]
+test/euclidean_index_test.py::test_get_nns_by_item PASSED                [ 27%]
+test/euclidean_index_test.py::test_dist PASSED                           [ 27%]
+test/euclidean_index_test.py::test_large_index PASSED                    [ 28%]
+test/euclidean_index_test.py::test_precision_1 PASSED                    [ 29%]
+test/euclidean_index_test.py::test_precision_10 PASSED                   [ 30%]
+test/euclidean_index_test.py::test_precision_100 PASSED                  [ 31%]
+test/euclidean_index_test.py::test_precision_1000 PASSED                 [ 31%]
+test/euclidean_index_test.py::test_get_nns_with_distances PASSED         [ 32%]
+test/euclidean_index_test.py::test_include_dists PASSED                  [ 33%]
+test/euclidean_index_test.py::test_distance_consistency PASSED           [ 34%]
+test/euclidean_index_test.py::test_rounding_error PASSED                 [ 34%]
+test/hamming_index_test.py::test_basic_conversion PASSED                 [ 35%]
+test/hamming_index_test.py::test_basic_nns PASSED                        [ 36%]
+test/hamming_index_test.py::test_save_load PASSED                        [ 37%]
+test/hamming_index_test.py::test_many_vectors PASSED                     [ 37%]
+test/hamming_index_test.py::test_zero_vectors SKIPPED (unconditional...) [ 38%]
+test/holes_test.py::test_random_holes PASSED                             [ 39%]
+test/holes_test.py::test_root_one_child PASSED                           [ 40%]
+test/holes_test.py::test_root_two_children PASSED                        [ 41%]
+test/holes_test.py::test_root_some_children PASSED                       [ 41%]
+test/holes_test.py::test_root_many_children PASSED                       [ 42%]
+test/index_test.py::test_not_found_tree PASSED                           [ 43%]
+test/index_test.py::test_binary_compatibility PASSED                     [ 44%]
+test/index_test.py::test_load_unload PASSED                              [ 44%]
+test/index_test.py::test_construct_load_destruct PASSED                  [ 45%]
+test/index_test.py::test_construct_destruct PASSED                       [ 46%]
+test/index_test.py::test_save_twice PASSED                               [ 47%]
+test/index_test.py::test_load_save PASSED                                [ 48%]
+test/index_test.py::test_save_without_build PASSED                       [ 48%]
+test/index_test.py::test_unbuild_with_loaded_tree PASSED                 [ 49%]
+test/index_test.py::test_seed PASSED                                     [ 50%]
+test/index_test.py::test_unknown_distance PASSED                         [ 51%]
+test/index_test.py::test_metric_kwarg PASSED                             [ 51%]
+test/index_test.py::test_metric_f_kwargs PASSED                          [ 52%]
+test/index_test.py::test_item_vector_after_save PASSED                   [ 53%]
+test/index_test.py::test_prefault PASSED                                 [ 54%]
+test/index_test.py::test_fail_save PASSED                                [ 55%]
+test/index_test.py::test_overwrite_index PASSED                          [ 55%]
+test/index_test.py::test_get_n_trees PASSED                              [ 56%]
+test/index_test.py::test_write_failed PASSED                             [ 57%]
+test/index_test.py::test_dimension_mismatch PASSED                       [ 58%]
+test/index_test.py::test_add_after_save PASSED                           [ 58%]
+test/index_test.py::test_build_twice PASSED                              [ 59%]
+test/index_test.py::test_very_large_index PASSED                         [ 60%]
+test/manhattan_index_test.py::test_get_nns_by_vector PASSED              [ 61%]
+test/manhattan_index_test.py::test_get_nns_by_item PASSED                [ 62%]
+test/manhattan_index_test.py::test_dist PASSED                           [ 62%]
+test/manhattan_index_test.py::test_large_index PASSED                    [ 63%]
+test/manhattan_index_test.py::test_precision_1 PASSED                    [ 64%]
+test/manhattan_index_test.py::test_precision_10 PASSED                   [ 65%]
+test/manhattan_index_test.py::test_precision_100 PASSED                  [ 65%]
+test/manhattan_index_test.py::test_precision_1000 PASSED                 [ 66%]
+test/manhattan_index_test.py::test_get_nns_with_distances PASSED         [ 67%]
+test/manhattan_index_test.py::test_include_dists PASSED                  [ 68%]
+test/manhattan_index_test.py::test_distance_consistency PASSED           [ 68%]
+test/memory_leak_test.py::test_get_item_vector PASSED                    [ 69%]
+test/memory_leak_test.py::test_get_lots_of_nns PASSED                    [ 70%]
+test/memory_leak_test.py::test_build_unbuid PASSED                       [ 71%]
+test/memory_leak_test.py::test_include_distances PASSED                  [ 72%]
+test/multithreaded_build_test.py::test_one_thread PASSED                 [ 72%]
+test/multithreaded_build_test.py::test_two_threads PASSED                [ 73%]
+test/multithreaded_build_test.py::test_four_threads PASSED               [ 74%]
+test/multithreaded_build_test.py::test_eight_threads PASSED              [ 75%]
+test/on_disk_build_test.py::test_on_disk PASSED                          [ 75%]
+test/seed_test.py::test_seeding PASSED                                   [ 76%]
+test/tenancy_test.py::test_budget_enforces_lru_eviction_order PASSED     [ 77%]
+test/tenancy_test.py::test_estimated_memory_matches_accounted_usage PASSED [ 78%]
+test/tenancy_test.py::test_inflight_lease_is_never_evicted PASSED        [ 79%]
+test/tenancy_test.py::test_concurrent_mount_loads_exactly_once PASSED    [ 79%]
+test/tenancy_test.py::test_concurrent_queries_across_tenants PASSED      [ 80%]
+test/tenancy_test.py::test_remount_results_are_identical PASSED          [ 81%]
+test/tenancy_test.py::test_single_tenant_exceeding_budget_is_rejected PASSED [ 82%]
+test/tenancy_test.py::test_corrupt_file_fails_only_that_tenant PASSED    [ 82%]
+test/tenancy_test.py::test_missing_file_fails_only_that_tenant PASSED    [ 83%]
+test/tenancy_test.py::test_dimension_mismatch_is_rejected PASSED         [ 84%]
+test/tenancy_test.py::test_failed_remount_raises_instead_of_empty_result PASSED [ 85%]
+test/tenancy_test.py::test_unknown_tenant_raises PASSED                  [ 86%]
+test/tenancy_test.py::test_idle_timeout_releases_and_records_last_access PASSED [ 86%]
+test/tenancy_test.py::test_idle_reaper_thread_releases_automatically PASSED [ 87%]
+test/tenancy_test.py::test_replaced_file_is_remounted_before_next_query PASSED [ 88%]
+test/tenancy_test.py::test_staleness_check_interval_remounts_after_window PASSED [ 89%]
+test/tenancy_test.py::test_budget_change_applies_without_restart PASSED  [ 89%]
+test/tenancy_test.py::test_existing_interface_is_untouched PASSED        [ 90%]
+test/tenancy_test.py::test_report_contains_required_fields PASSED        [ 91%]
+test/tenancy_test.py::test_unload_leaves_no_temp_files PASSED            [ 92%]
+test/tenancy_test.py::test_unregister_and_busy_errors PASSED             [ 93%]
+test/threading_test.py::test_threads PASSED                              [ 93%]
+test/types_test.py::test_numpy PASSED                                    [ 94%]
+test/types_test.py::test_tuple PASSED                                    [ 95%]
+test/types_test.py::test_wrong_length PASSED                             [ 96%]
+test/types_test.py::test_range_errors PASSED                             [ 96%]
+test/types_test.py::test_missing_len PASSED                              [ 97%]
+test/types_test.py::test_missing_getitem PASSED                          [ 98%]
+test/types_test.py::test_short PASSED                                    [ 99%]
+test/types_test.py::test_non_float PASSED                                [100%]
+
+=================================== FAILURES ===================================
+________________________________ test_glove_25 _________________________________
+
+    def test_glove_25():
+>       _test_index("glove-25-angular", 69.00)
+
+test/accuracy_test.py:93: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test/accuracy_test.py:68: in _test_index
+    annoy, dataset_f, dataset = _get_index(dataset, custom_metric, custom_dim)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test/accuracy_test.py:36: in _get_index
+    urlretrieve(url, vectors_fn)
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:214: in urlretrieve
+    with contextlib.closing(urlopen(url, data)) as fp:
+                            ^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:189: in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:495: in open
+    response = meth(req, response)
+               ^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:604: in http_response
+    response = self.parent.error(
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:533: in error
+    return self._call_chain(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:466: in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <urllib.request.HTTPDefaultErrorHandler object at 0x735ec580acf0>
+req = <urllib.request.Request object at 0x735ec580b620>
+fp = <http.client.HTTPResponse object at 0x735ec5b7e6b0>, code = 403
+msg = 'Forbidden', hdrs = <http.client.HTTPMessage object at 0x735ec57cf390>
+
+    def http_error_default(self, req, fp, code, msg, hdrs):
+>       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+E       urllib.error.HTTPError: HTTP Error 403: Forbidden
+
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:613: HTTPError
+----------------------------- Captured stdout call -----------------------------
+downloading http://ann-benchmarks.com/glove-25-angular.hdf5 -> test/glove-25-angular.hdf5
+_______________________________ test_nytimes_16 ________________________________
+
+    def test_nytimes_16():
+>       _test_index("nytimes-16-angular", 80.00)
+
+test/accuracy_test.py:97: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test/accuracy_test.py:68: in _test_index
+    annoy, dataset_f, dataset = _get_index(dataset, custom_metric, custom_dim)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test/accuracy_test.py:36: in _get_index
+    urlretrieve(url, vectors_fn)
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:214: in urlretrieve
+    with contextlib.closing(urlopen(url, data)) as fp:
+                            ^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:189: in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:495: in open
+    response = meth(req, response)
+               ^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:604: in http_response
+    response = self.parent.error(
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:533: in error
+    return self._call_chain(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:466: in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <urllib.request.HTTPDefaultErrorHandler object at 0x735ec580acf0>
+req = <urllib.request.Request object at 0x735ec57ccb90>
+fp = <http.client.HTTPResponse object at 0x735ec567f520>, code = 403
+msg = 'Forbidden', hdrs = <http.client.HTTPMessage object at 0x735ec548c3e0>
+
+    def http_error_default(self, req, fp, code, msg, hdrs):
+>       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+E       urllib.error.HTTPError: HTTP Error 403: Forbidden
+
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:613: HTTPError
+----------------------------- Captured stdout call -----------------------------
+downloading http://ann-benchmarks.com/nytimes-16-angular.hdf5 -> test/nytimes-16-angular.hdf5
+_______________________________ test_lastfm_dot ________________________________
+
+    def test_lastfm_dot():
+>       _test_index('lastfm-64-dot', 60.00, 'dot', 64)
+
+test/accuracy_test.py:101: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test/accuracy_test.py:68: in _test_index
+    annoy, dataset_f, dataset = _get_index(dataset, custom_metric, custom_dim)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test/accuracy_test.py:36: in _get_index
+    urlretrieve(url, vectors_fn)
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:214: in urlretrieve
+    with contextlib.closing(urlopen(url, data)) as fp:
+                            ^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:189: in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:495: in open
+    response = meth(req, response)
+               ^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:604: in http_response
+    response = self.parent.error(
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:533: in error
+    return self._call_chain(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:466: in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <urllib.request.HTTPDefaultErrorHandler object at 0x735ec580acf0>
+req = <urllib.request.Request object at 0x735ec57cfc50>
+fp = <http.client.HTTPResponse object at 0x735ef0a56fb0>, code = 403
+msg = 'Forbidden', hdrs = <http.client.HTTPMessage object at 0x735ec55bb2f0>
+
+    def http_error_default(self, req, fp, code, msg, hdrs):
+>       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+E       urllib.error.HTTPError: HTTP Error 403: Forbidden
+
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:613: HTTPError
+----------------------------- Captured stdout call -----------------------------
+downloading http://ann-benchmarks.com/lastfm-64-dot.hdf5 -> test/lastfm-64-dot.hdf5
+_____________________________ test_lastfm_angular ______________________________
+
+    def test_lastfm_angular():
+>       _test_index('lastfm-64-dot', 60.00, 'angular', 65)
+
+test/accuracy_test.py:105: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test/accuracy_test.py:68: in _test_index
+    annoy, dataset_f, dataset = _get_index(dataset, custom_metric, custom_dim)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+test/accuracy_test.py:36: in _get_index
+    urlretrieve(url, vectors_fn)
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:214: in urlretrieve
+    with contextlib.closing(urlopen(url, data)) as fp:
+                            ^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:189: in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:495: in open
+    response = meth(req, response)
+               ^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:604: in http_response
+    response = self.parent.error(
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:533: in error
+    return self._call_chain(*args)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:466: in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <urllib.request.HTTPDefaultErrorHandler object at 0x735ec580acf0>
+req = <urllib.request.Request object at 0x735ec548cc30>
+fp = <http.client.HTTPResponse object at 0x735ec54a6e60>, code = 403
+msg = 'Forbidden', hdrs = <http.client.HTTPMessage object at 0x735ec54888d0>
+
+    def http_error_default(self, req, fp, code, msg, hdrs):
+>       raise HTTPError(req.full_url, code, msg, hdrs, fp)
+E       urllib.error.HTTPError: HTTP Error 403: Forbidden
+
+../.local/share/uv/python/cpython-3.13.18-linux-x86_64-gnu/lib/python3.13/urllib/request.py:613: HTTPError
+----------------------------- Captured stdout call -----------------------------
+downloading http://ann-benchmarks.com/lastfm-64-dot.hdf5 -> test/lastfm-64-dot.hdf5
+=========================== short test summary info ============================
+FAILED test/accuracy_test.py::test_glove_25 - urllib.error.HTTPError: HTTP Er...
+FAILED test/accuracy_test.py::test_nytimes_16 - urllib.error.HTTPError: HTTP ...
+FAILED test/accuracy_test.py::test_lastfm_dot - urllib.error.HTTPError: HTTP ...
+FAILED test/accuracy_test.py::test_lastfm_angular - urllib.error.HTTPError: H...
+================== 4 failed, 124 passed, 1 skipped in 56.01s ===================

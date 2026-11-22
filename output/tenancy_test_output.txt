@@ -1,0 +1,29 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.18, pytest-9.2.0, pluggy-1.7.0 -- /tmp/uid80-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/wll/uid80
+collecting ... collected 21 items
+
+test/tenancy_test.py::test_budget_enforces_lru_eviction_order PASSED     [  4%]
+test/tenancy_test.py::test_estimated_memory_matches_accounted_usage PASSED [  9%]
+test/tenancy_test.py::test_inflight_lease_is_never_evicted PASSED        [ 14%]
+test/tenancy_test.py::test_concurrent_mount_loads_exactly_once PASSED    [ 19%]
+test/tenancy_test.py::test_concurrent_queries_across_tenants PASSED      [ 23%]
+test/tenancy_test.py::test_remount_results_are_identical PASSED          [ 28%]
+test/tenancy_test.py::test_single_tenant_exceeding_budget_is_rejected PASSED [ 33%]
+test/tenancy_test.py::test_corrupt_file_fails_only_that_tenant PASSED    [ 38%]
+test/tenancy_test.py::test_missing_file_fails_only_that_tenant PASSED    [ 42%]
+test/tenancy_test.py::test_dimension_mismatch_is_rejected PASSED         [ 47%]
+test/tenancy_test.py::test_failed_remount_raises_instead_of_empty_result PASSED [ 52%]
+test/tenancy_test.py::test_unknown_tenant_raises PASSED                  [ 57%]
+test/tenancy_test.py::test_idle_timeout_releases_and_records_last_access PASSED [ 61%]
+test/tenancy_test.py::test_idle_reaper_thread_releases_automatically PASSED [ 66%]
+test/tenancy_test.py::test_replaced_file_is_remounted_before_next_query PASSED [ 71%]
+test/tenancy_test.py::test_staleness_check_interval_remounts_after_window PASSED [ 76%]
+test/tenancy_test.py::test_budget_change_applies_without_restart PASSED  [ 80%]
+test/tenancy_test.py::test_existing_interface_is_untouched PASSED        [ 85%]
+test/tenancy_test.py::test_report_contains_required_fields PASSED        [ 90%]
+test/tenancy_test.py::test_unload_leaves_no_temp_files PASSED            [ 95%]
+test/tenancy_test.py::test_unregister_and_busy_errors PASSED             [100%]
+
+============================== 21 passed in 0.53s ==============================

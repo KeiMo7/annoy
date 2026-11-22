@@ -1,0 +1,9 @@
+index: 100000 items, dim=32, 10 trees; 4000 queries per configuration
+threads=1
+  raw                    88709 qps
+  managed (strict)       73406 qps  overhead=+17.3%
+  managed (interval)     81413 qps  overhead=+8.2%
+threads=4
+  raw                    28844 qps
+  managed (strict)       26574 qps  overhead=+7.9%
+  managed (interval)     35804 qps  overhead=-24.1%
